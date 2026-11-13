@@ -1,4 +1,4 @@
-# Pinned dependencies for agentrouter-codex-proxy
+# Pinned dependencies for the AgentRouter OpenCode Proxy
 fastapi==0.115.6
 starlette==0.41.3
 uvicorn==0.34.0

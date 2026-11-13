@@ -4,6 +4,7 @@
 
     Usage:
       .\uninstall-autostart.ps1
+      .\uninstall-autostart.ps1 -Mode combined
       .\uninstall-autostart.ps1 -TaskName AgentRouterCodexProxy -Port 8788
       .\uninstall-autostart.ps1 -KeepRunning     # unregister but leave it up
 #>
@@ -12,10 +13,16 @@
 param(
     [string]$TaskName = 'AgentRouterCodexProxy',
     [int]$Port = 8788,
+    [ValidateSet('responses', 'combined')]
+    [string]$Mode = 'responses',
     [switch]$KeepRunning
 )
 
 $ErrorActionPreference = 'Stop'
+if ($Mode -eq 'combined') {
+    if (-not $PSBoundParameters.ContainsKey('Port')) { $Port = 8789 }
+    if (-not $PSBoundParameters.ContainsKey('TaskName')) { $TaskName = 'AgentRouterCombinedProxy' }
+}
 
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if (-not $task) {
@@ -43,7 +50,10 @@ if (-not $conns) {
 $isOurs = $false
 try {
     $h = Invoke-RestMethod "http://127.0.0.1:$Port/_health" -TimeoutSec 5 -ErrorAction Stop
-    if ($h.status -eq 'ok' -and $h.listen -eq "127.0.0.1:$Port") { $isOurs = $true }
+    $required = if ($Mode -eq 'combined') { @('responses', 'chat.completions') } else { @('responses') }
+    $missing = @($required | Where-Object { $_ -notin $h.supported_apis })
+    if ($h.proxy -in @('agentrouter-codex-proxy', 'agentrouter-chat-proxy') -and
+        $h.status -eq 'ok' -and $h.listen -eq "127.0.0.1:$Port" -and $missing.Count -eq 0) { $isOurs = $true }
 } catch { }
 
 $ownerPids = @($conns | Select-Object -ExpandProperty OwningProcess -Unique)

@@ -11,17 +11,17 @@ AgentRouter's Responses endpoint:
   2. Converts the request into a Responses payload built only from conversation
      history. Nothing server-minted (`previous_response_id`, item IDs, encrypted
      reasoning) is sent, so the cross-resource session-state errors fixed by the
-     Codex proxy cannot occur in the first place.
+      Responses proxy cannot occur in the first place.
   3. Converts the upstream Responses SSE stream back into Chat Completions
      chunks, preserving streamed text, reasoning (`reasoning_content`) and tool
      calls (`tool_calls` with incremental `function.arguments`).
-  4. Reuses the Codex proxy's transport layer (resilient DNS, shared keep-alive
+   4. Reuses the Responses proxy's transport layer (resilient DNS, shared keep-alive
      pool, transport retries) and its pre-commit SSE priming, so early
      `rate_limit_exceeded` / `response.failed` / empty streams are retried
      before headers reach OpenCode.
    5. Routes native `/v1/responses` (and `/responses`) requests through the
-      Codex proxy's recovery handler, NEVER through generic passthrough.
-   6. Runs separately from the Codex proxy: port 8789 by default
+       Responses proxy's recovery handler, NEVER through generic passthrough.
+   6. Runs separately from the Responses proxy: port 8789 by default
      (`CHAT_PROXY_PORT` or `--port`).
 """
 
@@ -33,7 +33,6 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 import json
 import logging
-import math
 import os
 import sys
 import time
@@ -52,7 +51,7 @@ DEFAULT_LISTEN_HOST = proxy.DEFAULT_LISTEN_HOST
 PORT = int(os.environ.get("CHAT_PROXY_PORT", "8789"))
 LISTEN_HOST, PORT = proxy._extract_uvicorn_bind_overrides(sys.argv, DEFAULT_LISTEN_HOST, PORT)
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 STATS: Dict[str, Any] = {
     "requests_total": 0,
@@ -598,6 +597,8 @@ def _handle_stream_event(
 
 def _handle_stream_frame(state: _ChatStreamState, raw_frame: bytes) -> Tuple[List[bytes], bool]:
     event_name, obj, data_str = proxy._parse_sse_frame(raw_frame)
+    if obj is None and event_name.lower() in ("response.completed", "response.incomplete"):
+        return [], False  # Malformed terminal metadata is not a successful finish.
     if not event_name and obj is None:
         if data_str == "[DONE]":
             return _finish_chunks(state, "tool_calls" if state.saw_tool_call else "stop", None), True
@@ -627,8 +628,6 @@ async def _translate_responses_stream(
         created=int(time.time()),
         model=model,
     )
-    yield _chunk_bytes(state, {"role": "assistant", "content": ""})
-
     buf = bytearray(remainder or b"")
 
     def _consume_frames() -> Tuple[List[bytes], bool]:
@@ -649,6 +648,7 @@ async def _translate_responses_stream(
         return out, done
 
     try:
+        yield _chunk_bytes(state, {"role": "assistant", "content": ""})
         for raw_frame in primed_chunks or ():
             chunks, finished = _handle_stream_frame(state, raw_frame)
             for chunk in chunks:
@@ -691,7 +691,7 @@ async def _translate_responses_stream(
                 logger.warning("[Stream Interrupted] %s", type(producer_exc[0]).__name__)
             # Never turn a dropped connection / timeout into a successful stop,
             # or replay an already-delivered tool call behind the client's back.
-            yield b"data: " + json.dumps(proxy._stream_interrupted_error()).encode("utf-8") + b"\n\n"
+            yield b"data: " + json.dumps(proxy._producer_stream_error(producer_exc)).encode("utf-8") + b"\n\n"
             yield b"data: [DONE]\n\n"
     finally:
         await proxy._close_sse_producer(upstream_response, producer_task)
@@ -702,6 +702,8 @@ async def _translate_responses_stream(
 # ----------------------------------------------------------------------------
 @asynccontextmanager
 async def _app_lifespan(_: FastAPI):
+    if not proxy.is_loopback_host(LISTEN_HOST) and not proxy.PROXY_AUTH_TOKEN:
+        raise RuntimeError("Non-loopback listeners require PROXY_AUTH_TOKEN; restrict access with a firewall")
     if not proxy.is_loopback_host(LISTEN_HOST):
         logger.warning(
             "Non-loopback bind enabled (%s:%s) -- restrict access with a firewall "
@@ -717,10 +719,15 @@ async def _app_lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="agentrouter-chat-proxy",
-    description="Local Chat Completions and Responses compatibility proxy for OpenCode",
+    title="AgentRouter OpenCode Proxy",
+    description="Local Chat Completions and Responses compatibility proxy for OpenCode and AgentRouter",
     version=VERSION,
     lifespan=_app_lifespan,
+)
+app.add_middleware(
+    proxy.ProxyRequestGuard, token=lambda: proxy.PROXY_AUTH_TOKEN,
+    max_body_bytes=lambda: proxy.MAX_BODY_BYTES, upload_timeout_s=lambda: proxy.BODY_UPLOAD_TIMEOUT_S,
+    stats=proxy.STATS,
 )
 
 
@@ -732,6 +739,8 @@ async def health():
         "version": VERSION,
         "api": "chat.completions",
         "supported_apis": ["chat.completions", "responses"],
+        "proxy_auth_enabled": bool(proxy.PROXY_AUTH_TOKEN),
+        "max_body_bytes": proxy.MAX_BODY_BYTES,
         "listen": f"{LISTEN_HOST}:{PORT}",
         "uptime_seconds": round(time.time() - STATS["start_time"], 1),
         "upstream": UPSTREAM,
@@ -768,232 +777,44 @@ async def handle_chat_completions(request: Request):
     STATS["requests_total"] += 1
     STATS["chat_requests"] += 1
 
-    body_bytes = await request.body()
-    try:
-        payload = json.loads(body_bytes.decode("utf-8"))
-    except Exception:
-        return _chat_error(400, "Request body must be valid JSON", "invalid_request_error")
-    if not isinstance(payload, dict):
-        return _chat_error(400, "Request body must be a JSON object", "invalid_request_error")
+    payload, error = await proxy.read_json_payload(request)
+    if error is not None:
+        return error
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages or any(not isinstance(item, dict) for item in messages):
+        return _chat_error(400, "messages must be a non-empty array of objects", "invalid_request_error")
+    if any(item.get("role") not in ("system", "developer", "user", "assistant", "tool") for item in messages):
+        return _chat_error(400, "Each message must have a supported role", "invalid_request_error")
 
-    model = str(payload.get("model") or "")
-    want_stream = bool(payload.get("stream"))
-    STATS["stream_requests" if want_stream else "nonstream_requests"] += 1
-
-    headers = proxy._filter_headers(dict(request.headers))
-    headers["content-type"] = "application/json"
-
-    upstream_body = json.dumps(build_responses_payload(payload)).encode("utf-8")
-    upstream_url = f"{UPSTREAM}/v1/responses"
-
-    retry_start = time.monotonic()
-    transient_retries = 0
-
-    while True:
-        if not await proxy._wait_for_rate_limit_gate(
-            request, deadline=retry_start + proxy.MAX_RATE_LIMIT_WAIT_S
-        ):
-            if await proxy._client_disconnected(request):
-                return Response(status_code=499)
-            return proxy._shared_cooldown_response()
-
-        try:
-            resp = await proxy._send_with_transport_retry(
-                proxy.get_shared_client(),
-                method="POST",
-                url=upstream_url,
-                headers=headers,
-                content=upstream_body,
-                stream=True,
-                max_retries=1,  # Outer retry loop owns the budget; avoid nested retries.
-            )
-        except proxy.RETRYABLE_TRANSPORT_ERRORS as exc:
-            out = await _schedule_retry(
-                request, None, f"{type(exc).__name__}: {exc}",
-                is_rate_limit=False, label="Transport", attempts=transient_retries,
-                retry_start=retry_start,
-            )
-            if out is None:
-                proxy.STATS["transport_retries"] += 1
-                transient_retries += 1
-                continue
-            return out
-
-        resp_headers = proxy._clean_response_headers(resp.headers)
-        content_type = resp.headers.get("content-type", "").lower()
-
-        if resp.status_code == 200 and "text/event-stream" in content_type:
-            if not want_stream:
-                await proxy._close_sse_producer(resp, None)
-                logger.error("[Protocol] Upstream returned SSE for a non-streaming chat request")
-                return _chat_error(502, "Upstream returned a stream for a non-streaming request")
-
-            prime = await proxy._prime_responses_sse(resp, request)
-            if prime.status == "commit":
-                proxy._clear_rate_limit_cooldown()
-                logger.info(
-                    "[Stream] Translating Responses SSE -> Chat Completions chunks (model=%s)", model
-                )
-                return StreamingResponse(
-                    _translate_responses_stream(
-                        resp,
-                        primed_chunks=prime.primed_chunks,
-                        remainder=prime.remainder,
-                        queue=prime.queue,
-                        producer_task=prime.producer_task,
-                        producer_exc=prime.producer_exc,
-                        model=model,
-                    ),
-                    status_code=200,
-                    headers={**resp_headers, "cache-control": "no-cache"},
-                    media_type="text/event-stream",
-                )
-
-            if prime.status == "client_disconnected":
-                return Response(status_code=499)
-
-            STATS["precommit_retries"] += 1
-            is_rate_limit = prime.status == "retry_rate_limit"
-            out = await _schedule_retry(
-                request,
-                resp,
-                prime.error_message,
-                is_rate_limit=is_rate_limit,
-                label="Rate Limit / SSE" if is_rate_limit else "Stream Pre-Commit",
-                attempts=transient_retries,
-                retry_start=retry_start,
-            )
-            if out is None:
-                transient_retries += 1
-                continue
-            return out
-
-        try:
-            body = await proxy._read_and_close_response(resp)
-        except proxy.RETRYABLE_TRANSPORT_ERRORS as exc:
-            out = await _schedule_retry(
-                request, resp, f"{type(exc).__name__}: {exc}",
-                is_rate_limit=False, label="Response Read", attempts=transient_retries,
-                retry_start=retry_start,
-            )
-            if out is None:
-                proxy.STATS["transport_retries"] += 1
-                transient_retries += 1
-                continue
-            return out
-        body_text = body.decode("utf-8", errors="replace")
-
-        if resp.status_code == 200:
-            try:
-                parsed = json.loads(body_text)
-            except Exception:
-                return _chat_error(502, "Upstream returned a non-JSON completion", "proxy_error")
-            if not isinstance(parsed, dict):
-                return _chat_error(502, "Upstream returned an unexpected completion payload", "proxy_error")
-
-            if parsed.get("error") or parsed.get("status") == "failed":
-                code, message, error_obj = proxy._extract_error_fields(parsed, "")
-                is_rate_limit = proxy._is_rate_limit_error(code, message)
-                if is_rate_limit or proxy._is_transient_error(code, message):
-                    out = await _schedule_retry(
-                        request,
-                        resp,
-                        message,
-                        is_rate_limit=is_rate_limit,
-                        label="Rate Limit / JSON" if is_rate_limit else "JSON Error",
-                        attempts=transient_retries,
-                        retry_start=retry_start,
-                    )
-                    if out is None:
-                        transient_retries += 1
-                        continue
-                    return out
-                return _chat_error(502, message or "Upstream request failed", code=code)
-
-            proxy._clear_rate_limit_cooldown()
-            return JSONResponse(
-                content=responses_json_to_chat(parsed, model),
-                status_code=200,
-                headers=resp_headers,
-            )
-
-        is_rate_limit = resp.status_code == 429 or proxy._is_rate_limit_error("", body_text)
-        if resp.status_code in proxy.TRANSIENT_HTTP_STATUSES or (resp.status_code == 400 and is_rate_limit):
-            out = await _schedule_retry(
-                request,
-                resp,
-                body_text,
-                is_rate_limit=is_rate_limit,
-                label=f"Gateway {resp.status_code}",
-                attempts=transient_retries,
-                retry_start=retry_start,
-            )
-            if out is None:
-                transient_retries += 1
-                continue
-            return out
-
-        logger.error("[Forwarding Error %d] %s", resp.status_code, body_text[:200])
-        return Response(content=body, status_code=resp.status_code, headers=resp_headers)
-
-
-async def _schedule_retry(
-    request: Request,
-    resp: Optional[httpx.Response],
-    message: str,
-    *,
-    is_rate_limit: bool,
-    label: str,
-    attempts: int,
-    retry_start: float,
-) -> Optional[Response]:
-    """
-    Returns None when the caller should retry upstream, or the exhausted response.
-
-    `attempts` counts retries already performed, so callers increment it on None.
-    """
-    remaining_budget = proxy.MAX_RATE_LIMIT_WAIT_S - (time.monotonic() - retry_start)
-    if is_rate_limit:
-        STATS["rate_limits_caught"] += 1
-        streak = min(int(proxy._RATE_LIMIT_STATE["streak"]) + 1, 4)
-        delay_s, hint_s = proxy._extract_retry_delay_s(resp.headers if resp is not None else {}, message, streak)
-        retry_after = hint_s if hint_s is not None else max(
-            1, math.ceil(delay_s)
+    model = payload["model"]
+    STATS["stream_requests" if payload.get("stream") else "nonstream_requests"] += 1
+    result = await proxy.recover_responses_request(request, build_responses_payload(payload), chat_stats=STATS)
+    if isinstance(result, Response):
+        return result
+    resp_headers = proxy._clean_response_headers(result.response.headers)
+    if result.prime is not None:
+        prime = result.prime
+        return StreamingResponse(
+            _translate_responses_stream(
+                result.response, primed_chunks=prime.primed_chunks, remainder=prime.remainder,
+                queue=prime.queue, producer_task=prime.producer_task, producer_exc=prime.producer_exc, model=model,
+            ), status_code=200, headers={**resp_headers, "cache-control": "no-cache"}, media_type="text/event-stream",
         )
-        # Keep the FULL provider cooldown, including when this caller gives up.
-        proxy._record_rate_limit_cooldown(delay_s)
-    else:
-        delay_s = min(1.0 * (2 ** min(attempts, 3)) + 0.2, proxy.RATE_LIMIT_MAX_DELAY_S)
-        retry_after = max(1, int(round(delay_s)))
-
-    if attempts >= proxy.MAX_TRANSIENT_RETRIES or delay_s >= remaining_budget:
-        if is_rate_limit:
-            logger.error("[Forwarding Rate Limit 429] Exhausted retries: %s", (message or "")[:200])
-            return JSONResponse(
-                status_code=429,
-                content={"error": {
-                    "message": message or "Upstream rate limit exceeded",
-                    "type": "rate_limit_error",
-                    "code": "rate_limit_exceeded",
-                }},
-                headers={"retry-after": str(max(1, retry_after))},
-            )
-        logger.error("[Forwarding Upstream Error 502] %s", (message or "")[:200])
-        return _chat_error(502, message or "Upstream stream failed before emitting output")
-
-    wait_s = delay_s
-    logger.warning(
-        "[%s] Retrying (%d/%d) after %.1fs: %s",
-        label, attempts + 1, proxy.MAX_TRANSIENT_RETRIES, wait_s, (message or "")[:140],
-    )
-    if not await proxy._sleep_unless_disconnected(wait_s, request):
-        return Response(status_code=499)
-    return None
+    try:
+        parsed = json.loads(result.body)
+    except ValueError:
+        return _chat_error(502, "Upstream returned a non-JSON completion")
+    if not isinstance(parsed, dict):
+        return _chat_error(502, "Upstream returned an unexpected completion payload")
+    if parsed.get("error") or parsed.get("status") == "failed":
+        code, message, _ = proxy._extract_error_fields(parsed, "")
+        return _chat_error(502, message or "Upstream request failed", code=code)
+    return JSONResponse(content=responses_json_to_chat(parsed, model), status_code=200, headers=resp_headers)
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def passthrough_handler(request: Request, path: str):
-    """Passthrough for model listings and any other API routes."""
+    """Buffered forwarding for API routes permitted by the request guard."""
     STATS["requests_total"] += 1
 
     headers = proxy._filter_headers(dict(request.headers))
@@ -1019,7 +840,7 @@ async def passthrough_handler(request: Request, path: str):
         }
         return Response(content=resp.content, status_code=resp.status_code, headers=resp_headers)
     except Exception as exc:
-        logger.error("[Passthrough Error] %s -> %s: %s", request.method, target_url, str(exc))
+        logger.error("[Passthrough Error] %s -> %s: %s", request.method, target_url, proxy.redact_sensitive(str(exc)))
         return _chat_error(502, f"Proxy passthrough error: {exc}")
 
 
@@ -1036,6 +857,6 @@ if __name__ == "__main__":
 
     bind_scope = "loopback only" if proxy.is_loopback_host(LISTEN_HOST) else "non-loopback -- firewall required"
     url_host = f"[{LISTEN_HOST}]" if ":" in LISTEN_HOST and not LISTEN_HOST.startswith("[") else LISTEN_HOST
-    print(f"[*] Starting agentrouter-chat-proxy on http://{url_host}:{PORT} ({bind_scope})")
+    print(f"[*] Starting AgentRouter OpenCode Proxy (combined) on http://{url_host}:{PORT} ({bind_scope})")
     print(f"[*] Serving /v1/chat/completions and /v1/responses -> {UPSTREAM}/v1/responses")
     uvicorn.run(app, host=LISTEN_HOST, port=PORT, timeout_keep_alive=600, log_level="info")

@@ -1,9 +1,9 @@
 """
-proxy.py -- Local OpenAI Responses API compatibility proxy for Codex & AgentRouter.
+proxy.py -- Local OpenAI Responses API compatibility proxy for OpenCode and AgentRouter.
 
 Purpose
 -------
-When using Codex with AgentRouter, multi-turn sessions often fail with:
+When using OpenCode or another Responses client with AgentRouter, multi-turn sessions can fail with:
 "OpenAI Responses bad request: The requested item was created under a different
 **** OpenAI resource. Use the same resource that created the item to access it."
 
@@ -18,7 +18,7 @@ This proxy recovers requests that include replayable conversation history by:
   6. When an upstream resource mismatch or state error occurs (HTTP 400), activating a
       recovery phase with a sanitized stateless payload (stripping previous_response_id,
      server-minted item IDs, and un-decryptable reasoning tokens).
-  7. Streaming SSE events (`text/event-stream`) directly to Codex once upstream commits.
+  7. Streaming SSE events (`text/event-stream`) directly to the client once upstream commits.
 """
 
 from __future__ import annotations
@@ -46,6 +46,8 @@ from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Tuple
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+from request_guard import ProxyRequestGuard
 
 # ----------------------------------------------------------------------------
 # Logging Setup
@@ -230,7 +232,7 @@ def _extract_uvicorn_bind_overrides(
     if not argv:
         return default_host, default_port
     exe_name = Path(argv[0]).name.lower()
-    if "uvicorn" not in exe_name and "proxy:app" not in argv[1:]:
+    if "uvicorn" not in exe_name and not any(module in argv[1:] for module in ("proxy:app", "chat_proxy:app")):
         return default_host, default_port
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--host", default=default_host)
@@ -252,7 +254,7 @@ def _parse_proxy_cli_args(
     """Parse standalone CLI arguments for running `python proxy.py`."""
     resolved_default_port = default_port if default_port is not None else PORT
     parser = argparse.ArgumentParser(
-        description="Local OpenAI Responses API compatibility proxy for Codex & AgentRouter."
+        description="Local OpenAI API compatibility proxy for OpenCode and AgentRouter."
     )
     parser.add_argument(
         "--host",
@@ -293,6 +295,28 @@ SSE_PRIME_CREATED_GRACE_S = float(os.environ.get("PROXY_SSE_PRIME_CREATED_GRACE_
 CONNECT_TIMEOUT_S = float(os.environ.get("PROXY_CONNECT_TIMEOUT_S", "20.0"))
 READ_TIMEOUT_S = float(os.environ.get("PROXY_READ_TIMEOUT_S", "600.0"))
 
+
+def _positive_setting(name: str, default: str, *, integer: bool = False):
+    raw = os.environ.get(name, default)
+    try:
+        value = int(raw) if integer else float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive {'integer' if integer else 'number'}") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be positive and finite")
+    return value
+
+
+PROXY_AUTH_TOKEN = os.environ.get("PROXY_AUTH_TOKEN", "")
+MAX_BODY_BYTES = _positive_setting("PROXY_MAX_BODY_BYTES", "20971520", integer=True)
+BODY_UPLOAD_TIMEOUT_S = _positive_setting("PROXY_BODY_UPLOAD_TIMEOUT_S", "60")
+MAX_SSE_FRAME_BYTES = _positive_setting("PROXY_MAX_SSE_FRAME_BYTES", "8388608", integer=True)
+MAX_SSE_PRIME_BYTES = _positive_setting("PROXY_MAX_SSE_PRIME_BYTES", "8388608", integer=True)
+# Defaults preserve existing recovery behavior. Disable these two options for
+# conservative billing: read/write failures and 5xx can follow accepted work.
+RETRY_ON_5XX = os.environ.get("PROXY_RETRY_ON_5XX", "1").lower() not in ("0", "false", "no", "off")
+RETRY_AMBIGUOUS_ERRORS = os.environ.get("PROXY_RETRY_AMBIGUOUS_ERRORS", "1").lower() not in ("0", "false", "no", "off")
+
 CLIENT_TIMEOUT = httpx.Timeout(
     timeout=READ_TIMEOUT_S,
     connect=CONNECT_TIMEOUT_S,
@@ -306,15 +330,12 @@ RESOURCE_MISMATCH_PATTERNS = [
     re.compile(r"created under a different.*OpenAI resource", re.IGNORECASE),
     re.compile(r"Use the same resource that created the item", re.IGNORECASE),
     re.compile(r"requested item was created under a different", re.IGNORECASE),
-    re.compile(r"previous_response_id", re.IGNORECASE),
+    re.compile(r"previous_response_id.*(?:not found|different|invalid response)", re.IGNORECASE),
     re.compile(r"Response.*not found", re.IGNORECASE),
     re.compile(r"No response found", re.IGNORECASE),
     re.compile(r"No item found", re.IGNORECASE),
     re.compile(r"item.*not found", re.IGNORECASE),
     re.compile(r"Invalid.*\.id", re.IGNORECASE),
-    re.compile(r"Exceeded maximum number of images", re.IGNORECASE),
-    re.compile(r"maximum number of images", re.IGNORECASE),
-    re.compile(r"too many images", re.IGNORECASE),
 ]
 
 # Hop-by-hop headers to strip
@@ -330,12 +351,14 @@ HOP_BY_HOP = frozenset({
     "host",
     "content-length",
     "accept-encoding",
+    "x-proxy-token",  # Local authentication must never reach AgentRouter.
 })
 
 STRIP_RESPONSE_HEADERS = HOP_BY_HOP | {"content-encoding", "date"}
 
 RATE_LIMIT_CODES = frozenset({
     "rate_limit_exceeded",
+    "rate_limit_error",
     "tokens_limit_exceeded",
     "requests_limit_exceeded",
     "too_many_requests",
@@ -355,7 +378,7 @@ TRANSIENT_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 RETRYABLE_TRANSPORT_ERRORS = (httpx.NetworkError, httpx.TimeoutException, httpx.RemoteProtocolError)
 
 RATE_LIMIT_TEXT_RE = re.compile(
-    r"rate[_\s-]*limit|exceeded.*token|tokens?\s+per\s+min|too many requests|quota.*exceeded",
+    r"rate[_\s-]*limit|exceeded.*token|tokens?\s+per\s+min|too many requests",
     re.IGNORECASE,
 )
 
@@ -372,6 +395,27 @@ RETRY_AFTER_TEXT_RE = re.compile(
 RESET_DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(ms|s|m|h)", re.IGNORECASE)
 SSE_DELIM_RE = re.compile(rb"(?:\r\n\r\n|\n\n|\r\r)")
 SSE_SETUP_EVENTS = frozenset({"response.created", "response.queued", "response.in_progress", "ping", "keepalive"})
+SSE_COMMIT_EVENTS = frozenset({
+    "response.output_text.delta", "response.output_text.done", "response.refusal.delta", "response.refusal.done",
+    "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
+    "response.reasoning_text.delta", "response.reasoning_text.done",
+    "response.function_call_arguments.delta", "response.function_call_arguments.done",
+    "response.output_item.done", "response.content_part.done", "response.completed", "response.incomplete",
+    "response.custom_tool_call_input.delta", "response.custom_tool_call_input.done",
+})
+PERMANENT_ERROR_CODES = frozenset({
+    "insufficient_quota", "quota_exceeded", "billing_hard_limit_reached", "budget_exceeded",
+    "invalid_api_key", "authentication_error", "permission_denied", "unauthorized",
+    "invalid_request_error", "invalid_request", "context_length_exceeded", "model_not_found",
+    "content_filter", "content_policy_violation", "content_blocked", "content-blocked", "sensitive_words",
+})
+ACCOUNT_ERROR_RE = re.compile(
+    r"insufficient[_\s]+quota|exceeded (?:your )?current quota|quota (?:has been )?exhausted|"
+    r"(?:budget|credits?|balance).*(?:exhausted|insufficient|depleted)|"
+    r"(?:daily|monthly) quota.*exceeded|no available channel|无可用渠道",
+    re.IGNORECASE,
+)
+POLICY_ERROR_RE = re.compile(r"sensitive_words|content[-_]blocked|content policy|content filter", re.IGNORECASE)
 
 # ----------------------------------------------------------------------------
 # Image Capping Configuration & Utilities
@@ -455,6 +499,8 @@ STATS = {
     "stream_precommit_retries": 0,
     "rate_limit_wait_seconds_total": 0.0,
     "images_pruned_total": 0,
+    "requests_rejected_total": 0,
+    "permanent_errors_total": 0,
     "start_time": time.time(),
 }
 
@@ -630,22 +676,59 @@ def get_shared_client() -> httpx.AsyncClient:
 # Payload Sanitization (The Bulletproof Fix)
 # ----------------------------------------------------------------------------
 def is_resource_mismatch_text(text: str) -> bool:
-    """Checks if error text matches cross-resource item mismatch or image limit patterns."""
+    """Check for cross-resource item mismatch or invalid state references."""
     return any(pat.search(text) for pat in RESOURCE_MISMATCH_PATTERNS)
 
 def is_resource_mismatch_error(status_code: int, body_text: str) -> bool:
-    """Checks if an HTTP error response is due to cross-resource item mismatch or image limit."""
+    """Check for an HTTP 400 cross-resource or state-reference error."""
     return status_code == 400 and is_resource_mismatch_text(body_text)
 
 def _is_rate_limit_error(code: str, message: str) -> bool:
     c = (code or "").strip().lower()
+    if c in PERMANENT_ERROR_CODES or ACCOUNT_ERROR_RE.search(message or "") or POLICY_ERROR_RE.search(message or ""):
+        return False
     return c in RATE_LIMIT_CODES or bool(message and RATE_LIMIT_TEXT_RE.search(message))
 
 def _is_transient_error(code: str, message: str) -> bool:
     c = (code or "").strip().lower()
+    if c in PERMANENT_ERROR_CODES or ACCOUNT_ERROR_RE.search(message or "") or POLICY_ERROR_RE.search(message or ""):
+        return False
     return c in TRANSIENT_ERROR_CODES or bool(
         message and (RATE_LIMIT_TEXT_RE.search(message) or TRANSIENT_CAPACITY_TEXT_RE.search(message))
     )
+
+
+def classify_upstream_error(status_code: int, code: str, message: str) -> str:
+    """Classify the error before considering broad HTTP status retry rules."""
+    if status_code in (401, 403):
+        return "permanent"
+    if is_resource_mismatch_text(message or "") and status_code in (200, 400):
+        return "resource_mismatch"
+    if (status_code == 402 or (code or "").lower() in PERMANENT_ERROR_CODES
+            or ACCOUNT_ERROR_RE.search(message or "") or POLICY_ERROR_RE.search(message or "")):
+        return "permanent"
+    if status_code == 429 or _is_rate_limit_error(code, message):
+        return "rate_limit"
+    if status_code in (408, 500, 502, 503, 504):
+        return "transient" if status_code == 408 or RETRY_ON_5XX else "permanent"
+    if status_code == 200 and _is_transient_error(code, message):
+        return "transient" if RETRY_ON_5XX else "permanent"
+    return "permanent"
+
+
+def _retryable_transport_error(exc: Exception) -> bool:
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)):
+        return True
+    return RETRY_AMBIGUOUS_ERRORS and isinstance(exc, RETRYABLE_TRANSPORT_ERRORS)
+
+
+def redact_sensitive(text: str) -> str:
+    text = re.sub(r"(?i)\bBearer\s+[^\s\"'<>]+", "Bearer [redacted]", str(text))
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]+", "[redacted]", text)
+    for secret in (PROXY_AUTH_TOKEN, os.environ.get("CODEX_GATEWAY_API_KEY"), os.environ.get("AGENTROUTER_API_KEY")):
+        if secret:
+            text = text.replace(secret, "[redacted]")
+    return text
 
 def sanitize_responses_payload(payload: dict) -> dict:
     """
@@ -747,6 +830,8 @@ async def _send_with_transport_retry(
             )
             return await client.send(req, stream=stream)
         except RETRYABLE_TRANSPORT_ERRORS as exc:
+            if not _retryable_transport_error(exc):
+                raise
             last_exc = exc
             backoff_s = min(attempt * 0.75, 4.0)
             if attempt < max_retries:
@@ -773,6 +858,8 @@ async def _read_and_close_response(resp: httpx.Response) -> bytes:
 # ----------------------------------------------------------------------------
 @asynccontextmanager
 async def _app_lifespan(_: FastAPI):
+    if not is_loopback_host(LISTEN_HOST) and not PROXY_AUTH_TOKEN:
+        raise RuntimeError("Non-loopback listeners require PROXY_AUTH_TOKEN; restrict access with a firewall")
     if not is_loopback_host(LISTEN_HOST):
         logger.warning(
             "Non-loopback bind enabled (%s:%s) -- restrict access with a firewall "
@@ -789,21 +876,26 @@ async def _app_lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="agentrouter-codex-proxy",
-    description="Local compatibility proxy fixing OpenAI Responses cross-resource errors for Codex",
-    version="1.6.0",
+    title="AgentRouter OpenCode Proxy",
+    description="Local Responses compatibility proxy with cross-resource recovery for OpenCode and AgentRouter",
+    version="1.7.0",
     lifespan=_app_lifespan,
+)
+app.add_middleware(
+    ProxyRequestGuard, token=lambda: PROXY_AUTH_TOKEN, max_body_bytes=lambda: MAX_BODY_BYTES,
+    upload_timeout_s=lambda: BODY_UPLOAD_TIMEOUT_S, stats=STATS,
 )
 
 def _filter_headers(headers: Dict[str, str]) -> Dict[str, str]:
     """Filters client headers for proxy forwarding and injects fallback auth if needed."""
     out = {}
     has_auth = False
+    nominated = {name.strip().lower() for k, v in headers.items() if k.lower() == "connection" for name in v.split(",")}
     for k, v in headers.items():
         k_lower = k.lower()
         if k_lower == "authorization":
             has_auth = True
-        if k_lower not in HOP_BY_HOP:
+        if k_lower not in HOP_BY_HOP and k_lower not in nominated:
             out[k] = v
 
     if not has_auth:
@@ -824,7 +916,10 @@ async def health():
     return {
         "status": "ok",
         "proxy": "agentrouter-codex-proxy",
-        "version": "1.6.0",
+        "version": "1.7.0",
+        "supported_apis": ["responses"],
+        "proxy_auth_enabled": bool(PROXY_AUTH_TOKEN),
+        "max_body_bytes": MAX_BODY_BYTES,
         "dns_fallback_active": True,
         "max_images_per_request": MAX_IMAGES_PER_REQUEST,
         "listen": f"{LISTEN_HOST}:{PORT}",
@@ -841,7 +936,7 @@ async def stats():
 class SSEPrimeResult:
     """Result of pre-commit inspection on an HTTP 200 text/event-stream response."""
 
-    status: str  # "commit", "retry_rate_limit", "retry_transient", "resource_mismatch", "client_disconnected"
+    status: str  # commit, retry_rate_limit, retry_transient, resource_mismatch, fatal_error, client_disconnected
     primed_chunks: List[bytes] = field(default_factory=list)
     remainder: bytes = b""
     upstream_response: Optional[httpx.Response] = None
@@ -853,14 +948,47 @@ class SSEPrimeResult:
     error_payload: Optional[Dict[str, Any]] = None
 
 
+class SSEFrameTooLarge(Exception):
+    pass
+
+
+class _SSEFrameBuffer:
+    """Yield bounded frames without delaying small events for a fixed chunk size."""
+
+    def __init__(self):
+        self.buf = bytearray()
+
+    def feed(self, chunk: bytes):
+        # A transport can return many frames at once. Bound the partial frame,
+        # not the total transport chunk, and yield between frames for backpressure.
+        for offset in range(0, len(chunk), 65536):
+            self.buf.extend(chunk[offset:offset + 65536])
+            while True:
+                match = SSE_DELIM_RE.search(self.buf)
+                if match is None:
+                    break
+                end = match.end()
+                if end > MAX_SSE_FRAME_BYTES:
+                    raise SSEFrameTooLarge("Upstream SSE frame exceeds PROXY_MAX_SSE_FRAME_BYTES")
+                frame = bytes(self.buf[:end])
+                del self.buf[:end]
+                yield frame
+            if len(self.buf) > MAX_SSE_FRAME_BYTES:
+                raise SSEFrameTooLarge("Upstream SSE frame exceeds PROXY_MAX_SSE_FRAME_BYTES")
+
+
 async def _sse_producer(
     upstream_response: httpx.Response,
     queue: asyncio.Queue,
     producer_exc: List[Exception],
 ) -> None:
+    frames = _SSEFrameBuffer()
     try:
         async for chunk in upstream_response.aiter_bytes():
-            await queue.put(chunk)
+            for frame in frames.feed(chunk):
+                await queue.put(frame)
+        if frames.buf:
+            await queue.put(bytes(frames.buf))
         await queue.put(None)
     except Exception as exc:
         producer_exc.append(exc)
@@ -920,6 +1048,13 @@ def _parse_sse_frame(raw_frame: bytes) -> Tuple[str, Optional[Dict[str, Any]], s
     return event_name, parsed, data_str
 
 
+def _is_terminal_sse_frame(raw_frame: bytes) -> bool:
+    event_name, parsed, data_str = _parse_sse_frame(raw_frame)
+    return data_str == "[DONE]" or (
+        parsed is not None and event_name in ("response.completed", "response.incomplete", "response.failed", "error")
+    )
+
+
 def _extract_error_fields(
     obj: Optional[Dict[str, Any]],
     fallback_text: str = "",
@@ -968,12 +1103,24 @@ def _classify_sse_frame(raw_frame: bytes) -> Tuple[str, str, str, Optional[Dict[
     ):
         # Structural events alone are not content; Azure may reject immediately
         # after adding an empty message/reasoning item.
+        if ev_lower == "response.output_item.added" and isinstance(parsed, dict):
+            item = parsed.get("item")
+            if isinstance(item, dict) and item.get("type") not in (None, "message", "reasoning", "function_call", "custom_tool_call"):
+                # A hosted tool may already have acted upstream. Do not replay it.
+                return "commit", "", "", None
         return "setup", "", "", None
 
     if data_str == "[DONE]" and not ev_lower:
         return "ignore", "", "", None
 
-    return "commit", "", "", None
+    if ev_lower in SSE_COMMIT_EVENTS or ev_lower.startswith((
+        "response.web_search_call.", "response.file_search_call.", "response.code_interpreter_call.",
+        "response.image_generation_call.", "response.mcp_call.", "response.mcp_list_tools.", "response.computer_call.",
+    )):
+        return "commit", "", "", None
+    # Billing summaries and unknown metadata are not model output. They must
+    # not prevent recovery of an error that follows in the initial window.
+    return "ignore", "", "", None
 
 
 async def _prime_responses_sse(
@@ -984,9 +1131,9 @@ async def _prime_responses_sse(
     created_grace_s: Optional[float] = None,
 ) -> SSEPrimeResult:
     """
-    Buffers initial SSE frames before committing HTTP 200 headers to Codex.
+    Buffers initial SSE frames before committing HTTP 200 headers to the client.
     Catches early HTTP-200 rate_limit_exceeded / response.failed / empty streams
-    so the proxy can retry silently without tripping Codex reconnect banners.
+    so the proxy can retry silently without triggering client reconnect banners.
     """
     if first_frame_timeout_s is None:
         first_frame_timeout_s = SSE_PRIME_FIRST_TIMEOUT_S
@@ -998,6 +1145,7 @@ async def _prime_responses_sse(
 
     buf = bytearray()
     primed_chunks: List[bytes] = []
+    primed_bytes = 0
     saw_setup = False
     overall_deadline = time.monotonic() + first_frame_timeout_s
     grace_deadline: Optional[float] = None
@@ -1018,7 +1166,10 @@ async def _prime_responses_sse(
         return SSEPrimeResult(status=status, error_code=code, error_message=msg, error_payload=payload)
 
     async def handle_frame(raw_frame: bytes, trailing_after: bytes) -> Optional[SSEPrimeResult]:
-        nonlocal saw_setup, grace_deadline
+        nonlocal saw_setup, grace_deadline, primed_bytes
+        primed_bytes += len(raw_frame)
+        if primed_bytes > MAX_SSE_PRIME_BYTES:
+            return await abort_result("fatal_error", "upstream_sse_prime_too_large", "Initial SSE buffer exceeds PROXY_MAX_SSE_PRIME_BYTES")
         kind, err_code, err_msg, err_obj = _classify_sse_frame(raw_frame)
         if kind == "ignore":
             primed_chunks.append(raw_frame)
@@ -1031,13 +1182,15 @@ async def _prime_responses_sse(
             return None
         if kind == "error":
             primed_chunks.append(raw_frame)
-            if is_resource_mismatch_text(err_msg):
+            category = classify_upstream_error(200, err_code, err_msg)
+            if category == "resource_mismatch":
                 return await abort_result("resource_mismatch", err_code, err_msg, err_obj)
-            if _is_rate_limit_error(err_code, err_msg):
+            if category == "rate_limit":
                 return await abort_result("retry_rate_limit", err_code, err_msg, err_obj)
-            if _is_transient_error(err_code, err_msg):
+            if category == "transient":
                 return await abort_result("retry_transient", err_code, err_msg, err_obj)
             # Non-retryable upstream SSE rejection: commit & forward verbatim.
+            STATS["permanent_errors_total"] += 1
             return commit_result(trailing_after)
 
         primed_chunks.append(raw_frame)
@@ -1054,7 +1207,8 @@ async def _prime_responses_sse(
             if remaining <= 0:
                 if grace_deadline is not None and saw_setup:
                     return commit_result(bytes(buf))
-                return await abort_result("retry_transient", "timeout", "SSE prime timeout waiting for upstream event")
+                status = "retry_transient" if RETRY_AMBIGUOUS_ERRORS else "fatal_error"
+                return await abort_result(status, "upstream_sse_prime_timeout", "SSE prime timeout waiting for upstream event")
 
             try:
                 chunk = await asyncio.wait_for(queue.get(), timeout=min(remaining, 0.35))
@@ -1062,12 +1216,17 @@ async def _prime_responses_sse(
                 continue
 
             if chunk is None:
+                if producer_exc and isinstance(producer_exc[0], SSEFrameTooLarge):
+                    return await abort_result("fatal_error", "upstream_sse_frame_too_large", str(producer_exc[0]))
                 if buf:
                     res = await handle_frame(bytes(buf), b"")
                     if res is not None:
                         if res.status == "commit":
                             await queue.put(None)
                         return res
+                if ((producer_exc and not _retryable_transport_error(producer_exc[0]))
+                        or (not producer_exc and not RETRY_AMBIGUOUS_ERRORS)):
+                    return await abort_result("fatal_error", "upstream_stream_interrupted", "Upstream stream ended before output; no retry was permitted")
                 err_note = str(producer_exc[0]) if producer_exc else "Upstream SSE stream closed before emitting content"
                 return await abort_result("retry_transient", "empty_stream", err_note)
 
@@ -1085,7 +1244,8 @@ async def _prime_responses_sse(
         await _close_sse_producer(upstream_response, producer_task)
         raise
     except Exception as exc:
-        return await abort_result("retry_transient", type(exc).__name__, str(exc))
+        status = "retry_transient" if _retryable_transport_error(exc) else "fatal_error"
+        return await abort_result(status, "upstream_stream_interrupted", redact_sensitive(str(exc)))
 
 
 async def _stream_generator(
@@ -1099,7 +1259,7 @@ async def _stream_generator(
     ping_interval: float = 15.0,
 ) -> AsyncIterator[bytes]:
     """
-    Streams SSE chunks from upstream back to Codex with periodic keep-alive heartbeat comments.
+    Streams SSE chunks from upstream back to the client with periodic keep-alive heartbeat comments.
     Replays any pre-commit primed frames verbatim before continuing live chunks.
     """
     if queue is None or producer_task is None:
@@ -1115,9 +1275,9 @@ async def _stream_generator(
         event_buf.extend(chunk)
         pos = 0
         for match in SSE_DELIM_RE.finditer(event_buf):
-            event_name, _, data_str = _parse_sse_frame(bytes(event_buf[pos:match.end()]))
+            terminal = _is_terminal_sse_frame(bytes(event_buf[pos:match.end()]))
             pos = match.end()
-            if event_name in ("response.completed", "response.incomplete", "response.failed", "error") or data_str == "[DONE]":
+            if terminal:
                 last_event_seen = True
         if pos:
             del event_buf[:pos]
@@ -1127,9 +1287,13 @@ async def _stream_generator(
             if pre:
                 observe_events(pre)
                 yield pre
+                if last_event_seen:
+                    return
         if remainder:
             observe_events(remainder)
             yield remainder
+            if last_event_seen:
+                return
 
         while True:
             try:
@@ -1138,22 +1302,23 @@ async def _stream_generator(
                     break
                 observe_events(chunk)
                 yield chunk
+                if last_event_seen:
+                    return
             except asyncio.TimeoutError:
                 yield b": ping\n\n"
         if event_buf:
-            event_name, _, data_str = _parse_sse_frame(bytes(event_buf))
-            last_event_seen = last_event_seen or event_name in ("response.completed", "response.incomplete", "response.failed", "error") or data_str == "[DONE]"
+            last_event_seen = last_event_seen or _is_terminal_sse_frame(bytes(event_buf))
         if not last_event_seen:
             if producer_exc:
                 logger.warning("[Stream Interrupted] %s", type(producer_exc[0]).__name__)
-            err = _stream_interrupted_error()["error"]
+            err = _producer_stream_error(producer_exc)["error"]
             if event_buf:
                 yield b"\n\n"  # Separate any truncated upstream frame from ours.
             yield b"event: error\ndata: " + json.dumps({
                 "type": "error", "code": err["code"], "message": err["message"], "param": None,
             }).encode("utf-8") + b"\n\n"
     except Exception as exc:
-        logger.warning("[Stream Exception] Upstream SSE connection interrupted: %s", str(exc))
+        logger.warning("[Stream Exception] Upstream SSE connection interrupted: %s", redact_sensitive(str(exc)))
     finally:
         await _close_sse_producer(upstream_response, producer_task)
         if not last_event_seen:
@@ -1170,6 +1335,15 @@ def _stream_interrupted_error() -> Dict[str, Any]:
         "type": "proxy_error",
         "code": "upstream_stream_interrupted",
     }}
+
+
+def _producer_stream_error(producer_exc: Optional[List[Exception]]) -> Dict[str, Any]:
+    if producer_exc and isinstance(producer_exc[0], SSEFrameTooLarge):
+        return {"error": {
+            "type": "proxy_error", "code": "upstream_sse_frame_too_large",
+            "message": "Upstream SSE frame exceeded the configured size limit. Partial output was not replayed.",
+        }}
+    return _stream_interrupted_error()
 
 
 def _rate_limit_error_response(
@@ -1199,26 +1373,70 @@ def _shared_cooldown_response() -> JSONResponse:
     )
 
 
+@dataclass
+class RecoveredResponses:
+    """An upstream response ready for native forwarding or Chat conversion."""
+
+    response: httpx.Response
+    body: bytes = b""
+    prime: Optional[SSEPrimeResult] = None
+
+
+async def read_json_payload(request: Request) -> Tuple[Optional[dict], Optional[Response]]:
+    try:
+        payload = json.loads(await request.body())
+    except (ValueError, UnicodeDecodeError):
+        return None, JSONResponse(status_code=400, content={"error": {
+            "message": "Request body must be valid JSON", "type": "invalid_request_error",
+        }})
+    if not isinstance(payload, dict):
+        return None, JSONResponse(status_code=400, content={"error": {
+            "message": "Request body must be a JSON object", "type": "invalid_request_error",
+        }})
+    if not isinstance(payload.get("model"), str) or not payload["model"].strip():
+        return None, JSONResponse(status_code=400, content={"error": {
+            "message": "model must be a non-empty string", "type": "invalid_request_error",
+        }})
+    if "stream" in payload and not isinstance(payload["stream"], bool):
+        return None, JSONResponse(status_code=400, content={"error": {
+            "message": "stream must be a boolean", "type": "invalid_request_error",
+        }})
+    return payload, None
+
+
 @app.post("/v1/responses")
 @app.post("/responses")
 async def handle_responses(request: Request):
-    """
-    Main handler for Codex /v1/responses.
-    Performs pre-commit SSE priming, staggered rate-limit recovery, and stateless
-    sanitization fallback on cross-resource mismatches.
-    """
     STATS["requests_total"] += 1
     STATS["responses_requests"] += 1
+    payload, error = await read_json_payload(request)
+    if error is not None:
+        return error
+    result = await recover_responses_request(request, payload)
+    if isinstance(result, Response):
+        return result
+    headers = _clean_response_headers(result.response.headers)
+    if result.prime is not None:
+        prime = result.prime
+        return StreamingResponse(
+            _stream_generator(
+                result.response, primed_chunks=prime.primed_chunks, remainder=prime.remainder,
+                queue=prime.queue, producer_task=prime.producer_task, producer_exc=prime.producer_exc,
+            ), status_code=200, headers=headers, media_type="text/event-stream",
+        )
+    return Response(content=result.body, status_code=result.response.status_code, headers=headers)
 
-    body_bytes = await request.body()
-    try:
-        body_json = json.loads(body_bytes.decode("utf-8"))
-    except Exception:
-        return JSONResponse(status_code=400, content={"error": {"message": "Request body must be valid JSON", "type": "invalid_request_error"}})
-    if not isinstance(body_json, dict):
-        return JSONResponse(status_code=400, content={"error": {"message": "Request body must be a JSON object", "type": "invalid_request_error"}})
 
+async def recover_responses_request(
+    request: Request, body_json: dict, *, chat_stats: Optional[dict] = None,
+) -> RecoveredResponses | Response:
+    """
+    One recovery pipeline for native Responses and translated Chat requests.
+    All attempts share payload limits, error classification, retry budgets,
+    connection cleanup, and the pre-header SSE inspection window.
+    """
     headers = _filter_headers(dict(request.headers))
+    headers["content-type"] = "application/json"
     upstream_url = f"{UPSTREAM}/v1/responses"
 
     active_payload = body_json
@@ -1239,17 +1457,40 @@ async def handle_responses(request: Request):
     mismatch_attempts = 0
     max_mismatch_retries = 3
     last_failure_response: Optional[Response] = None
+    history_error: Optional[Response] = None
 
     def activate_stateless_fallback(source_label: str, detail: str) -> bool:
-        nonlocal fallback_active, active_payload, mismatch_attempts
+        nonlocal fallback_active, active_payload, mismatch_attempts, history_error
         STATS["resource_mismatches_caught"] += 1
-        logger.warning("[Resource Mismatch] %s: %s", source_label, detail[:160])
+        logger.warning("[Resource Mismatch] %s: %s", source_label, redact_sensitive(detail)[:160])
         if not fallback_active and body_json is not None:
-            fallback_active = True
-            STATS["stateless_fallbacks_applied"] += 1
-            active_payload = sanitize_responses_payload(
+            clean_payload = sanitize_responses_payload(
                 active_payload if active_payload is not None else body_json
             )
+            replay_input = clean_payload.get("input")
+            replay_items = replay_input if isinstance(replay_input, list) else []
+            call_ids = {item["call_id"] for item in replay_items if isinstance(item, dict)
+                        and item.get("type") == "function_call" and isinstance(item.get("call_id"), str)}
+            has_content = bool(replay_input.strip()) if isinstance(replay_input, str) else any(
+                    isinstance(item, dict) and (item.get("content") or item.get("output") or item.get("type") == "function_call")
+                    for item in replay_items
+                )
+            if (not has_content or any(
+                    isinstance(item, dict) and (
+                        item.get("type") == "compaction" or
+                        (item.get("type") == "function_call_output" and (
+                            not isinstance(item.get("call_id"), str) or item["call_id"] not in call_ids
+                        ))
+                    ) for item in replay_items
+                )):
+                history_error = JSONResponse(status_code=400, content={"error": {
+                    "type": "invalid_request_error", "code": "recovery_history_missing",
+                    "message": "Azure session recovery requires replayable conversation history and matching tool calls. IDs or encrypted checkpoints alone cannot restore it.",
+                }})
+                return False
+            fallback_active = True
+            STATS["stateless_fallbacks_applied"] += 1
+            active_payload = clean_payload
             logger.warning("[Recovery] Activating sanitized stateless payload to bypass cross-resource pinning!")
             return True
         mismatch_attempts += 1
@@ -1264,6 +1505,8 @@ async def handle_responses(request: Request):
         nonlocal transient_retries
         if is_rate_limit:
             STATS["rate_limits_caught"] += 1
+            if chat_stats is not None:
+                chat_stats["rate_limits_caught"] += 1
             streak = min(int(_RATE_LIMIT_STATE["streak"]) + 1, 4)
             delay_s, hint_s = _extract_retry_delay_s(resp_hdrs, err_msg, streak)
             suggested_ra = hint_s if hint_s is not None else max(1, math.ceil(delay_s))
@@ -1280,7 +1523,7 @@ async def handle_responses(request: Request):
         transient_retries += 1
         logger.warning(
             "[%s] Retrying (%d/%d) after %.1fs: %s",
-            label, transient_retries, MAX_TRANSIENT_RETRIES, wait_s, (err_msg or "")[:140]
+            label, transient_retries, MAX_TRANSIENT_RETRIES, wait_s, redact_sensitive(err_msg or "")[:140]
         )
         ok = await _sleep_unless_disconnected(wait_s, request)
         return ok, suggested_ra
@@ -1291,7 +1534,13 @@ async def handle_responses(request: Request):
                 return Response(status_code=499)
             return _shared_cooldown_response()
 
-        req_content = json.dumps(active_payload).encode("utf-8") if active_payload is not None else body_bytes
+        req_content = json.dumps(active_payload).encode("utf-8")
+        if len(req_content) > MAX_BODY_BYTES:
+            STATS["requests_rejected_total"] += 1
+            return JSONResponse(status_code=413, content={"error": {
+                "type": "invalid_request_error", "code": "payload_too_large",
+                "message": "Converted request exceeds PROXY_MAX_BODY_BYTES",
+            }})
 
         try:
             client = get_shared_client()
@@ -1309,6 +1558,12 @@ async def handle_responses(request: Request):
             content_type = resp.headers.get("content-type", "")
 
             if resp.status_code == 200 and "text/event-stream" in content_type.lower():
+                if not body_json.get("stream", False):
+                    await resp.aclose()
+                    return JSONResponse(status_code=502, content={"error": {
+                        "type": "proxy_error", "code": "upstream_protocol_error",
+                        "message": "Upstream returned SSE for a non-streaming request",
+                    }})
                 prime = await _prime_responses_sse(resp, request)
                 if prime.status == "commit":
                     _clear_rate_limit_cooldown()
@@ -1318,27 +1573,21 @@ async def handle_responses(request: Request):
                             "[Success] Request recovered (fallback=%s, retries=%d)!",
                             fallback_active, transient_retries + mismatch_attempts
                         )
-                    return StreamingResponse(
-                        _stream_generator(
-                            resp,
-                            primed_chunks=prime.primed_chunks,
-                            remainder=prime.remainder,
-                            queue=prime.queue,
-                            producer_task=prime.producer_task,
-                            producer_exc=prime.producer_exc,
-                        ),
-                        status_code=200,
-                        headers=resp_headers,
-                        media_type="text/event-stream",
-                    )
+                    return RecoveredResponses(response=resp, prime=prime)
 
                 if prime.status == "client_disconnected":
                     return Response(status_code=499)
+                if prime.status == "fatal_error":
+                    return JSONResponse(status_code=502, content={"error": {
+                        "type": "proxy_error", "code": prime.error_code, "message": prime.error_message,
+                    }})
 
                 if prime.status == "resource_mismatch":
                     if activate_stateless_fallback("SSE 200 error", prime.error_message):
                         await asyncio.sleep((RETRY_DELAY_MS / 1000.0) * max(1, mismatch_attempts))
                         continue
+                    if history_error is not None:
+                        return history_error
                     return JSONResponse(
                         status_code=400,
                         content={"error": prime.error_payload or {"message": prime.error_message, "code": prime.error_code}},
@@ -1347,6 +1596,8 @@ async def handle_responses(request: Request):
 
                 is_rl = prime.status == "retry_rate_limit"
                 STATS["stream_precommit_retries"] += 1
+                if chat_stats is not None:
+                    chat_stats["precommit_retries"] += 1
                 should_retry, suggested_ra = await schedule_transient_wait(
                     is_rl,
                     resp.headers,
@@ -1358,11 +1609,11 @@ async def handle_responses(request: Request):
                 if await _client_disconnected(request):
                     return Response(status_code=499)
                 if is_rl:
-                    logger.error("[Forwarding Rate Limit 429] Exhausted retries: %s", prime.error_message[:200])
+                    logger.error("[Forwarding Rate Limit 429] Exhausted retries: %s", redact_sensitive(prime.error_message)[:200])
                     return _rate_limit_error_response(
                         prime.error_payload, prime.error_message, prime.error_code, suggested_ra, resp_headers
                     )
-                logger.error("[Forwarding Stream Error 502] %s", prime.error_message[:200])
+                logger.error("[Forwarding Stream Error 502] %s", redact_sensitive(prime.error_message)[:200])
                 return JSONResponse(
                     status_code=502,
                     content={"error": {"message": prime.error_message or "Upstream stream failed before emitting output", "type": "proxy_error"}},
@@ -1382,12 +1633,15 @@ async def handle_responses(request: Request):
                     bool(parsed_body.get("error")) or parsed_body.get("status") == "failed"
                 ):
                     code, msg, err_obj = _extract_error_fields(parsed_body, "")
-                    if is_resource_mismatch_text(msg):
+                    category = classify_upstream_error(200, code, msg)
+                    if category == "resource_mismatch":
                         if activate_stateless_fallback("JSON 200 error", msg):
                             continue
+                        if history_error is not None:
+                            return history_error
                         return JSONResponse(status_code=400, content={"error": err_obj}, headers=resp_headers)
-                    elif _is_rate_limit_error(code, msg) or _is_transient_error(code, msg):
-                        is_rl = _is_rate_limit_error(code, msg)
+                    elif category in ("rate_limit", "transient"):
+                        is_rl = category == "rate_limit"
                         should_retry, suggested_ra = await schedule_transient_wait(
                             is_rl, resp.headers, msg, "Rate Limit / JSON" if is_rl else "JSON Error"
                         )
@@ -1398,28 +1652,39 @@ async def handle_responses(request: Request):
                         return JSONResponse(status_code=502, content={"error": err_obj}, headers=resp_headers)
 
                     # Do not count a failed JSON response as a successful recovery.
-                    return Response(content=body, status_code=200, headers=resp_headers)
+                    STATS["permanent_errors_total"] += 1
+                    return RecoveredResponses(response=resp, body=body)
 
                 _clear_rate_limit_cooldown()
                 if fallback_active or transient_retries > 0 or mismatch_attempts > 0:
                     STATS["successful_recoveries"] += 1
                     logger.info("[Success] Request recovered!")
-                return Response(content=body, status_code=200, headers=resp_headers)
+                return RecoveredResponses(response=resp, body=body)
 
             # Non-200 HTTP status
             err_body = await _read_and_close_response(resp)
             err_text = err_body.decode("utf-8", errors="replace")
 
-            if is_resource_mismatch_error(resp.status_code, err_text):
+            parsed_error = None
+            try:
+                parsed_error = json.loads(err_text)
+            except ValueError:
+                pass
+            code, message, _ = _extract_error_fields(parsed_error if isinstance(parsed_error, dict) else None, err_text)
+            category = classify_upstream_error(resp.status_code, code, message)
+
+            if category == "resource_mismatch":
                 if activate_stateless_fallback("Upstream 400", err_text):
                     if mismatch_attempts > 0:
                         await asyncio.sleep((RETRY_DELAY_MS / 1000.0) * mismatch_attempts)
                     continue
-                logger.error("[Forwarding Error %d] %s", resp.status_code, err_text[:200])
+                if history_error is not None:
+                    return history_error
+                logger.error("[Forwarding Error %d] %s", resp.status_code, redact_sensitive(err_text)[:200])
                 return Response(content=err_body, status_code=resp.status_code, headers=resp_headers)
 
-            is_http_rl = resp.status_code == 429 or _is_rate_limit_error("", err_text)
-            if resp.status_code in TRANSIENT_HTTP_STATUSES or (resp.status_code == 400 and is_http_rl):
+            is_http_rl = category == "rate_limit"
+            if category in ("rate_limit", "transient"):
                 should_retry, suggested_ra = await schedule_transient_wait(
                     is_http_rl,
                     resp.headers,
@@ -1434,18 +1699,21 @@ async def handle_responses(request: Request):
                     return _rate_limit_error_response(None, err_text, "rate_limit_exceeded", suggested_ra, resp_headers)
                 if resp.status_code == 429 and not any(k.lower() == "retry-after" for k in resp_headers):
                     resp_headers["retry-after"] = str(suggested_ra)
-                logger.error("[Forwarding Error %d] %s", resp.status_code, err_text[:200])
+                logger.error("[Forwarding Error %d] %s", resp.status_code, redact_sensitive(err_text)[:200])
                 return Response(content=err_body, status_code=resp.status_code, headers=resp_headers)
 
-            logger.error("[Forwarding Error %d] %s", resp.status_code, err_text[:200])
+            STATS["permanent_errors_total"] += 1
+            logger.error("[Forwarding Error %d] %s", resp.status_code, redact_sensitive(err_text)[:200])
             return Response(content=err_body, status_code=resp.status_code, headers=resp_headers)
 
         except RETRYABLE_TRANSPORT_ERRORS as exc:
-            logger.error("[Attempt Exception] %s", str(exc))
+            logger.error("[Attempt Exception] %s", redact_sensitive(str(exc)))
             last_failure_response = JSONResponse(
                 status_code=502,
                 content={"error": {"message": f"Proxy upstream communication error: {str(exc)}", "type": "proxy_error"}},
             )
+            if not _retryable_transport_error(exc):
+                return last_failure_response
             should_retry, _ = await schedule_transient_wait(False, {}, str(exc), "Attempt Exception")
             if should_retry:
                 STATS["transport_retries"] += 1
@@ -1454,7 +1722,7 @@ async def handle_responses(request: Request):
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def passthrough_handler(request: Request, path: str):
-    """Passthrough for models listing or any other API routes."""
+    """Buffered forwarding for API routes permitted by the request guard."""
     STATS["requests_total"] += 1
 
     headers = _filter_headers(dict(request.headers))
@@ -1484,7 +1752,7 @@ async def passthrough_handler(request: Request, path: str):
         }
         return Response(content=resp.content, status_code=resp.status_code, headers=resp_headers)
     except Exception as exc:
-        logger.error("[Passthrough Error] %s -> %s: %s", request.method, target_url, str(exc))
+        logger.error("[Passthrough Error] %s -> %s: %s", request.method, target_url, redact_sensitive(str(exc)))
         return JSONResponse(
             status_code=502,
             content={"error": {"message": f"Proxy passthrough error: {str(exc)}", "type": "proxy_error"}}
@@ -1503,6 +1771,6 @@ if __name__ == "__main__":
 
     bind_scope = "loopback only" if is_loopback_host(LISTEN_HOST) else "non-loopback -- firewall required"
     url_host = f"[{LISTEN_HOST}]" if ":" in LISTEN_HOST and not LISTEN_HOST.startswith("[") else LISTEN_HOST
-    print(f"[*] Starting agentrouter-codex-proxy on http://{url_host}:{PORT} ({bind_scope})")
+    print(f"[*] Starting AgentRouter OpenCode Proxy (responses) on http://{url_host}:{PORT} ({bind_scope})")
     print(f"[*] Forwarding to upstream: {UPSTREAM}")
     uvicorn.run(app, host=LISTEN_HOST, port=PORT, timeout_keep_alive=600, log_level="info")

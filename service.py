@@ -159,13 +159,21 @@ def _format_url_host(host: str) -> str:
     return f"[{host}]" if ":" in host and not host.startswith("[") else host
 
 
-def _probe_our_health(port: int, host: str = "127.0.0.1", timeout_s: float = 3.0) -> bool:
+def _probe_our_health(
+    port: int, host: str = "127.0.0.1", timeout_s: float = 3.0, *, mode: Optional[str] = None,
+) -> bool:
     connect_host = _probe_connect_host(host)
     url = f"http://{_format_url_host(connect_host)}:{port}/_health"
     try:
         with urllib.request.urlopen(url, timeout=timeout_s) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
-            return data.get("status") == "ok" and data.get("listen") == f"{host}:{port}"
+            if not isinstance(data, dict):
+                return False
+            identity_ok = data.get("proxy") in ("agentrouter-codex-proxy", "agentrouter-chat-proxy")
+            required = {"responses", "chat.completions"} if mode == "combined" else {"responses"}
+            apis = data.get("supported_apis")
+            apis_ok = mode is None or (isinstance(apis, list) and all(api in apis for api in required))
+            return identity_ok and apis_ok and data.get("status") == "ok" and data.get("listen") == f"{host}:{port}"
     except (urllib.error.URLError, OSError, ValueError):
         return False
 
@@ -231,6 +239,8 @@ def _respawn_self(args: argparse.Namespace) -> None:
     cmd = [
         exe,
         str(ROOT / "service.py"),
+        "--mode",
+        args.mode,
         "--host",
         args.host,
         "--port",
@@ -275,28 +285,43 @@ def _remove_pid_file(pid_path: Path) -> None:
 
 
 def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Headless background supervisor for AgentRouter Codex proxy.")
+    parser = argparse.ArgumentParser(description="Headless background supervisor for the AgentRouter OpenCode Proxy.")
+    parser.add_argument("--mode", choices=("responses", "combined"), default="responses")
     parser.add_argument(
         "--host",
         default="127.0.0.1",
         help="Bind address (default: 127.0.0.1 loopback only; pass 0.0.0.0 explicitly for Docker/LAN).",
     )
-    parser.add_argument("--port", type=int, default=int(os.environ.get("PROXY_PORT", "8788")))
+    parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--max-log-kb", type=int, default=1024)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--no-auto-update", action="store_true")
     parser.add_argument("--skip-start-update", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.port is None:
+        port_name, default = ("CHAT_PROXY_PORT", "8789") if args.mode == "combined" else ("PROXY_PORT", "8788")
+        try:
+            args.port = int(os.environ.get(port_name, default))
+        except ValueError:
+            parser.error(f"{port_name} must be an integer")
     args.host = (args.host or "").strip() or "127.0.0.1"
     if not (1 <= args.port <= 65535):
         parser.error("--port must be between 1 and 65535")
     return args
 
 
+def _worker_command(worker_python: str, args: argparse.Namespace) -> list[str]:
+    module = "chat_proxy:app" if args.mode == "combined" else "proxy:app"
+    return [
+        worker_python, "-m", "uvicorn", module, "--host", args.host, "--port", str(args.port),
+        "--timeout-keep-alive", "600", "--log-level", "warning", "--no-access-log",
+    ]
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     updater.load_env_file(ROOT)
     args = _parse_args(argv)
-    os.environ["PROXY_PORT"] = str(args.port)
+    os.environ["CHAT_PROXY_PORT" if args.mode == "combined" else "PROXY_PORT"] = str(args.port)
     if args.verbose:
         os.environ["PROXY_VERBOSE"] = "1"
     os.environ.setdefault("PYTHONIOENCODING", "utf-8:replace")
@@ -305,7 +330,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     pid_path = ROOT / "logs" / "service.pid"
 
     if _is_port_busy(args.port, args.host):
-        if _probe_our_health(args.port, args.host):
+        if _probe_our_health(args.port, args.host, mode=args.mode):
             logger.write("ok   ", f"proxy already healthy on {args.host}:{args.port} -- exiting cleanly")
             return 0
         logger.write(
@@ -315,6 +340,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     if not _is_loopback_host(args.host):
+        if not os.environ.get("PROXY_AUTH_TOKEN"):
+            logger.write("fail ", "non-loopback listeners require PROXY_AUTH_TOKEN; leaving the listener stopped")
+            return 1
         logger.write(
             "warn ",
             f"non-loopback bind enabled ({args.host}:{args.port}) -- "
@@ -396,22 +424,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         while not stop_event.is_set() and not restart_for_update.is_set():
             started_at = time.monotonic()
-            cmd = [
-                worker_python,
-                "-m",
-                "uvicorn",
-                "proxy:app",
-                "--host",
-                args.host,
-                "--port",
-                str(args.port),
-                "--timeout-keep-alive",
-                "600",
-                "--log-level",
-                "warning",
-                "--no-access-log",
-            ]
-            logger.write("start", f"starting headless uvicorn on {args.host}:{args.port}")
+            cmd = _worker_command(worker_python, args)
+            logger.write("start", f"starting AgentRouter OpenCode Proxy ({args.mode}) via headless uvicorn on {args.host}:{args.port}")
             proc = subprocess.Popen(cmd, **_subprocess_kwargs(pipe_output=True))
             with child_lock:
                 active_child["proc"] = proc

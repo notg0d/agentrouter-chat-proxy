@@ -1,4 +1,4 @@
-"""Automated unit and async integration tests for agentrouter-codex-proxy."""
+"""Automated unit and async integration tests for the AgentRouter OpenCode Proxy."""
 
 from __future__ import annotations
 
@@ -533,6 +533,7 @@ class TestUpdaterAndHeadlessService(unittest.TestCase):
         proc = subprocess.Popen(
             [sys.executable, str(root / "proxy.py"), "--host", "0.0.0.0", "--port", str(port)],
             cwd=str(root),
+            env={**os.environ, "PROXY_AUTH_TOKEN": "local-test-only"},
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

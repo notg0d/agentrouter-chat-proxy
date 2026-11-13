@@ -1,5 +1,5 @@
 <#
-    start-proxy.ps1 -- launch the AgentRouter Codex compatibility proxy.
+    start-proxy.ps1 -- launch the AgentRouter OpenCode Proxy.
 
     Every path is derived from this script's own location, so the repository
     can be cloned anywhere by any user.
@@ -18,6 +18,7 @@
       .\start-proxy.ps1 -BindHost 0.0.0.0          # bind non-loopback (Docker/LAN; restrict firewall!)
       .\start-proxy.ps1 -Verbose_                  # extra diagnostics
       .\start-proxy.ps1 -Background                # launch headless background service (no console window)
+      .\start-proxy.ps1 -Mode combined -Background # both client APIs on port 8789
       .\start-proxy.ps1 -Update                    # check/apply fast-forward git updates before starting
       .\start-proxy.ps1 -Service                   # supervised, rotating log file
 #>
@@ -25,6 +26,8 @@
 [CmdletBinding()]
 param(
     [int]$Port = 8788,
+    [ValidateSet('responses', 'combined')]
+    [string]$Mode = 'responses',
     [string]$BindHost = '127.0.0.1',
     [switch]$Verbose_,
     # Launch detached via pythonw.exe (no console window) and return immediately.
@@ -43,13 +46,15 @@ $ErrorActionPreference = 'Stop'
 # Script-directory anchored. Works from any clone location and any username.
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
+if ($Mode -eq 'combined' -and -not $PSBoundParameters.ContainsKey('Port')) { $Port = 8789 }
+if ($Port -lt 1 -or $Port -gt 65535) { throw 'Port must be between 1 and 65535.' }
+$appModule = if ($Mode -eq 'combined') { 'chat_proxy:app' } else { 'proxy:app' }
 
 # ---------------------------------------------------------------------------
 # Logging. Console when run interactively, rotating file under -Service.
 #
-# Nothing written here can contain credentials, prompts, or model output: the
-# credential check below prints a length only, and the proxy's own log emits
-# structural diagnostics exclusively.
+# The credential check prints only a length. Upstream error logs use basic
+# credential redaction, but are not guaranteed to exclude all sensitive text.
 # ---------------------------------------------------------------------------
 $script:LogPath   = $null
 $script:MaxBytes  = $MaxLogKB * 1KB
@@ -112,7 +117,10 @@ function Test-OurProxy {
     $urlHost = if ($probeHost -match ':' -and -not $probeHost.StartsWith('[')) { "[$probeHost]" } else { $probeHost }
     try {
         $probe = Invoke-RestMethod "http://${urlHost}:${OnPort}/_health" -TimeoutSec 5 -ErrorAction Stop
-        return ($probe.status -eq 'ok' -and $probe.listen -eq "${OnHost}:${OnPort}")
+        $required = if ($Mode -eq 'combined') { @('responses', 'chat.completions') } else { @('responses') }
+        $missing = @($required | Where-Object { $_ -notin $probe.supported_apis })
+        return ($probe.proxy -in @('agentrouter-codex-proxy', 'agentrouter-chat-proxy') -and
+                $probe.status -eq 'ok' -and $probe.listen -eq "${OnHost}:${OnPort}" -and $missing.Count -eq 0)
     } catch { return $false }
 }
 
@@ -160,8 +168,10 @@ if (Test-Path $envFile) {
         $name  = $trimmed.Substring(0, $split).Trim()
         $value = $trimmed.Substring($split + 1).Trim().Trim('"').Trim("'")
         if (-not $name -or -not $value) { continue }
-        Set-Item -Path "Env:$name" -Value $value
-        $loaded++
+        if ($null -eq [Environment]::GetEnvironmentVariable($name)) {
+            Set-Item -Path "Env:$name" -Value $value
+            $loaded++
+        }
     }
     Write-Ok ".env loaded ($loaded variable(s), values not displayed)"
 }
@@ -169,6 +179,11 @@ if (Test-Path $envFile) {
 # ---------------------------------------------------------------------------
 # 2. Locate Python
 # ---------------------------------------------------------------------------
+if (-not (Test-IsLoopbackHost -OnHost $BindHost) -and [string]::IsNullOrEmpty($env:PROXY_AUTH_TOKEN)) {
+    Write-Err 'Non-loopback listeners require PROXY_AUTH_TOKEN. Restrict access with a firewall.'
+    exit 1
+}
+
 Write-Step 'Locating Python interpreter'
 
 $venvPython = Join-Path $root '.venv\Scripts\python.exe'
@@ -261,8 +276,8 @@ foreach ($name in @('CODEX_GATEWAY_API_KEY', 'AGENTROUTER_API_KEY', 'OPENAI_API_
 if ($keyVar) {
     Write-Ok "credential found in `$env:$keyVar (length $keyLen, value not displayed)"
 } else {
-    Write-Warn 'No CODEX_GATEWAY_API_KEY / AGENTROUTER_API_KEY set.'
-    Write-Warn 'Codex will forward whatever token is set in config.toml or send its own.'
+    Write-Warn 'No fallback AgentRouter API key found in the environment.'
+    Write-Warn 'Configure OpenCode to send its AgentRouter API key in the Authorization header.'
 }
 
 # ---------------------------------------------------------------------------
@@ -273,7 +288,7 @@ $env:PYTHONIOENCODING = 'utf-8:replace'
 
 try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch { }
 
-$env:PROXY_PORT = "$Port"
+if ($Mode -eq 'combined') { $env:CHAT_PROXY_PORT = "$Port" } else { $env:PROXY_PORT = "$Port" }
 
 $upstream = $env:AGENTROUTER_UPSTREAM
 if ([string]::IsNullOrWhiteSpace($upstream)) { $upstream = 'https://agentrouter.org' }
@@ -287,7 +302,7 @@ if (-not $isLoopback) {
 }
 
 Write-Line ''
-Write-Line '  AgentRouter Codex Responses Compatibility Proxy' 'White'
+Write-Line "  AgentRouter OpenCode Proxy ($Mode)" 'White'
 Write-Line "  upstream : $upstream"  'DarkGray'
 Write-Line "  listen   : http://${BindHost}:${Port} $bindNote" 'DarkGray'
 Write-Line "  stats    : http://${displayProbeUrl}:${Port}/_stats" 'DarkGray'
@@ -315,7 +330,7 @@ function Invoke-Uvicorn {
     $ErrorActionPreference = 'Continue'
     $script:LastUvicornExit = $null
     try {
-        & $python -m uvicorn proxy:app --host $OnHost --port $OnPort --timeout-keep-alive 600 --log-level warning --no-access-log 2>&1 |
+        & $python -m uvicorn $appModule --host $OnHost --port $OnPort --timeout-keep-alive 600 --log-level warning --no-access-log 2>&1 |
             ForEach-Object { Write-Line ([string]$_) }
         $script:LastUvicornExit = $LASTEXITCODE
     } finally {
@@ -334,7 +349,7 @@ if ($Background) {
         Write-Err 'pythonw.exe or service.py not found for -Background mode.'
         exit 1
     }
-    $svcArgs = "`"$serviceScript`" --host `"$BindHost`" --port $Port --max-log-kb $MaxLogKB"
+    $svcArgs = "`"$serviceScript`" --mode $Mode --host `"$BindHost`" --port $Port --max-log-kb $MaxLogKB"
     if ($Verbose_) { $svcArgs += ' --verbose' }
     Start-Process -FilePath $pythonw -ArgumentList $svcArgs -WorkingDirectory $root -WindowStyle Hidden
     $ready = $false
