@@ -725,10 +725,30 @@ def _retryable_transport_error(exc: Exception) -> bool:
 def redact_sensitive(text: str) -> str:
     text = re.sub(r"(?i)\bBearer\s+[^\s\"'<>]+", "Bearer [redacted]", str(text))
     text = re.sub(r"\bsk-[A-Za-z0-9_-]+", "[redacted]", text)
-    for secret in (PROXY_AUTH_TOKEN, os.environ.get("CODEX_GATEWAY_API_KEY"), os.environ.get("AGENTROUTER_API_KEY")):
+    for secret in (
+        PROXY_AUTH_TOKEN, os.environ.get("CODEX_GATEWAY_API_KEY"),
+        os.environ.get("AGENTROUTER_API_KEY"), os.environ.get("CODEX_AGENTROUTER_GATEWAY_KEY"),
+    ):
         if secret:
             text = text.replace(secret, "[redacted]")
     return text
+
+
+def describe_exception(exc: BaseException) -> str:
+    """Return a non-empty, redacted exception summary without request or traceback data."""
+    def summarize(error: BaseException) -> str:
+        message = str(error).strip()
+        name = type(error).__name__
+        return f"{name}: {message}" if message else name
+
+    description = summarize(exc)
+    cause = exc.__cause__
+    if cause is not None and cause is not exc:
+        cause_description = summarize(cause)
+        if cause_description != description:
+            description += f" (caused by {cause_description})"
+    return redact_sensitive(description)
+
 
 def sanitize_responses_payload(payload: dict) -> dict:
     """
@@ -837,7 +857,7 @@ async def _send_with_transport_retry(
             if attempt < max_retries:
                 logger.warning(
                     "[Transport Retry %d/%d] %s. Reconnecting in %.1fs...",
-                    attempt, max_retries, type(exc).__name__, backoff_s,
+                    attempt, max_retries, describe_exception(exc), backoff_s,
                 )
                 STATS["transport_retries"] += 1
                 await asyncio.sleep(backoff_s)
@@ -1227,7 +1247,7 @@ async def _prime_responses_sse(
                 if ((producer_exc and not _retryable_transport_error(producer_exc[0]))
                         or (not producer_exc and not RETRY_AMBIGUOUS_ERRORS)):
                     return await abort_result("fatal_error", "upstream_stream_interrupted", "Upstream stream ended before output; no retry was permitted")
-                err_note = str(producer_exc[0]) if producer_exc else "Upstream SSE stream closed before emitting content"
+                err_note = describe_exception(producer_exc[0]) if producer_exc else "Upstream SSE stream closed before emitting content"
                 return await abort_result("retry_transient", "empty_stream", err_note)
 
             buf.extend(chunk)
@@ -1245,7 +1265,7 @@ async def _prime_responses_sse(
         raise
     except Exception as exc:
         status = "retry_transient" if _retryable_transport_error(exc) else "fatal_error"
-        return await abort_result(status, "upstream_stream_interrupted", redact_sensitive(str(exc)))
+        return await abort_result(status, "upstream_stream_interrupted", describe_exception(exc))
 
 
 async def _stream_generator(
@@ -1310,7 +1330,7 @@ async def _stream_generator(
             last_event_seen = last_event_seen or _is_terminal_sse_frame(bytes(event_buf))
         if not last_event_seen:
             if producer_exc:
-                logger.warning("[Stream Interrupted] %s", type(producer_exc[0]).__name__)
+                logger.warning("[Stream Interrupted] %s", describe_exception(producer_exc[0]))
             err = _producer_stream_error(producer_exc)["error"]
             if event_buf:
                 yield b"\n\n"  # Separate any truncated upstream frame from ours.
@@ -1318,7 +1338,7 @@ async def _stream_generator(
                 "type": "error", "code": err["code"], "message": err["message"], "param": None,
             }).encode("utf-8") + b"\n\n"
     except Exception as exc:
-        logger.warning("[Stream Exception] Upstream SSE connection interrupted: %s", redact_sensitive(str(exc)))
+        logger.warning("[Stream Exception] Upstream SSE connection interrupted: %s", describe_exception(exc))
     finally:
         await _close_sse_producer(upstream_response, producer_task)
         if not last_event_seen:
@@ -1343,7 +1363,10 @@ def _producer_stream_error(producer_exc: Optional[List[Exception]]) -> Dict[str,
             "type": "proxy_error", "code": "upstream_sse_frame_too_large",
             "message": "Upstream SSE frame exceeded the configured size limit. Partial output was not replayed.",
         }}
-    return _stream_interrupted_error()
+    error = _stream_interrupted_error()
+    if producer_exc:
+        error["error"]["message"] += f" Cause: {describe_exception(producer_exc[0])}"
+    return error
 
 
 def _rate_limit_error_response(
@@ -1707,14 +1730,15 @@ async def recover_responses_request(
             return Response(content=err_body, status_code=resp.status_code, headers=resp_headers)
 
         except RETRYABLE_TRANSPORT_ERRORS as exc:
-            logger.error("[Attempt Exception] %s", redact_sensitive(str(exc)))
+            diagnostic = describe_exception(exc)
+            logger.error("[Attempt Exception] %s", diagnostic)
             last_failure_response = JSONResponse(
                 status_code=502,
-                content={"error": {"message": f"Proxy upstream communication error: {str(exc)}", "type": "proxy_error"}},
+                content={"error": {"message": f"Proxy upstream communication error: {diagnostic}", "type": "proxy_error"}},
             )
             if not _retryable_transport_error(exc):
                 return last_failure_response
-            should_retry, _ = await schedule_transient_wait(False, {}, str(exc), "Attempt Exception")
+            should_retry, _ = await schedule_transient_wait(False, {}, diagnostic, "Attempt Exception")
             if should_retry:
                 STATS["transport_retries"] += 1
                 continue
@@ -1752,10 +1776,11 @@ async def passthrough_handler(request: Request, path: str):
         }
         return Response(content=resp.content, status_code=resp.status_code, headers=resp_headers)
     except Exception as exc:
-        logger.error("[Passthrough Error] %s -> %s: %s", request.method, target_url, redact_sensitive(str(exc)))
+        diagnostic = describe_exception(exc)
+        logger.error("[Passthrough Error] %s -> %s: %s", request.method, target_url, diagnostic)
         return JSONResponse(
             status_code=502,
-            content={"error": {"message": f"Proxy passthrough error: {str(exc)}", "type": "proxy_error"}}
+            content={"error": {"message": f"Proxy passthrough error: {diagnostic}", "type": "proxy_error"}}
         )
 
 # ----------------------------------------------------------------------------

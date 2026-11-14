@@ -688,7 +688,7 @@ async def _translate_responses_stream(
 
         if not state.finished:
             if producer_exc:
-                logger.warning("[Stream Interrupted] %s", type(producer_exc[0]).__name__)
+                logger.warning("[Stream Interrupted] %s", proxy.describe_exception(producer_exc[0]))
             # Never turn a dropped connection / timeout into a successful stop,
             # or replay an already-delivered tool call behind the client's back.
             yield b"data: " + json.dumps(proxy._producer_stream_error(producer_exc)).encode("utf-8") + b"\n\n"
@@ -840,8 +840,9 @@ async def passthrough_handler(request: Request, path: str):
         }
         return Response(content=resp.content, status_code=resp.status_code, headers=resp_headers)
     except Exception as exc:
-        logger.error("[Passthrough Error] %s -> %s: %s", request.method, target_url, proxy.redact_sensitive(str(exc)))
-        return _chat_error(502, f"Proxy passthrough error: {exc}")
+        diagnostic = proxy.describe_exception(exc)
+        logger.error("[Passthrough Error] %s -> %s: %s", request.method, target_url, diagnostic)
+        return _chat_error(502, f"Proxy passthrough error: {diagnostic}")
 
 
 # ----------------------------------------------------------------------------

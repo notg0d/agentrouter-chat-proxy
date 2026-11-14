@@ -90,7 +90,7 @@ class RecoveryRegressionTests(unittest.IsolatedAsyncioTestCase):
         proxy.reset_rate_limit_state()
 
     async def respond(self, request):
-        self.calls.append(json.loads(request.content))
+        self.calls.append(json.loads(request.content) if request.content else None)
         if not self.script:
             raise AssertionError("Unexpected extra upstream attempt")
         item = self.script.pop(0)
@@ -193,6 +193,99 @@ class RecoveryRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status_code, 502)
         self.assertEqual(len(self.calls), 3)  # Initial send + 2, not 5 nested attempts each.
 
+    async def test_blank_transport_errors_name_attempts_without_changing_retry_count(self):
+        for endpoint in ("/v1/responses", "/v1/chat/completions"):
+            with self.subTest(endpoint=endpoint):
+                start = len(self.calls)
+                self.script.extend([httpx.ReadTimeout("") for _ in range(3)])
+                with self.assertLogs(proxy.logger, level="WARNING") as captured:
+                    result = await self.local.post(endpoint, json=self.request_body(endpoint))
+                self.assertEqual(result.status_code, 502)
+                self.assertEqual(result.json()["error"]["message"], "Proxy upstream communication error: ReadTimeout")
+                self.assertEqual(result.json()["error"]["type"], "proxy_error")
+                self.assertEqual(len(self.calls), start + 3)
+                attempts = [record.getMessage() for record in captured.records if record.levelname == "ERROR"]
+                retries = [record.getMessage() for record in captured.records if "Retrying" in record.getMessage()]
+                self.assertEqual(attempts, ["[Attempt Exception] ReadTimeout"] * 3)
+                self.assertEqual(len(retries), 2)
+                self.assertTrue(all(message.endswith(": ReadTimeout") for message in retries))
+
+    async def test_communication_error_details_are_redacted_in_logs_and_responses(self):
+        with patch.object(proxy, "RETRY_AMBIGUOUS_ERRORS", False):
+            for endpoint in ("/v1/responses", "/v1/chat/completions"):
+                with self.subTest(endpoint=endpoint):
+                    self.script.append(httpx.ReadError("connection failed: Bearer diagnostic-token sk-test-key"))
+                    with self.assertLogs(proxy.logger, level="ERROR") as captured:
+                        result = await self.local.post(endpoint, json=self.request_body(endpoint))
+                    self.assertEqual(result.status_code, 502)
+                    diagnostic = result.text + "\n" + "\n".join(captured.output)
+                    self.assertIn("ReadError: connection failed", diagnostic)
+                    self.assertIn("[redacted]", diagnostic)
+                    self.assertNotIn("diagnostic-token", diagnostic)
+                    self.assertNotIn("sk-test-key", diagnostic)
+
+    async def test_precommit_stream_exception_details_are_not_blank(self):
+        with patch.object(proxy, "MAX_TRANSIENT_RETRIES", 0):
+            for endpoint in ("/v1/responses", "/v1/chat/completions"):
+                with self.subTest(endpoint=endpoint):
+                    start = len(self.calls)
+                    upstream = _sse(httpx.RemoteProtocolError(""))
+                    stream = upstream.stream
+                    self.script.append(upstream)
+                    with self.assertLogs(proxy.logger, level="ERROR") as captured:
+                        result = await self.local.post(endpoint, json=self.request_body(endpoint, stream=True))
+                    self.assertEqual(result.status_code, 502)
+                    self.assertIn("RemoteProtocolError", result.json()["error"]["message"])
+                    self.assertIn("RemoteProtocolError", "\n".join(captured.output))
+                    self.assertEqual(len(self.calls), start + 1)
+                    self.assertTrue(stream.closed)
+
+    async def test_partial_stream_exception_details_are_redacted_without_replay(self):
+        for endpoint in ("/v1/responses", "/v1/chat/completions"):
+            for message in ("", "stream closed: Bearer diagnostic-token sk-test-key"):
+                with self.subTest(endpoint=endpoint, message=message):
+                    start = len(self.calls)
+                    self.script.append(_sse(DELTA, httpx.ReadTimeout(message)))
+                    with self.assertLogs(level="WARNING") as captured:
+                        result = await self.local.post(endpoint, json=self.request_body(endpoint, stream=True))
+                    self.assertIn("partial", result.text)
+                    self.assertIn("upstream_stream_interrupted", result.text)
+                    self.assertIn("ReadTimeout", result.text)
+                    diagnostic = result.text + "\n" + "\n".join(captured.output)
+                    self.assertNotIn("diagnostic-token", diagnostic)
+                    self.assertNotIn("sk-test-key", diagnostic)
+                    self.assertNotIn('"finish_reason": "stop"', result.text)
+                    self.assertEqual(len(self.calls), start + 1)
+
+    async def test_passthrough_exception_details_are_named_and_redacted(self):
+        with patch.object(proxy, "RETRY_AMBIGUOUS_ERRORS", False):
+            for app in (proxy.app, chat_proxy.app):
+                with self.subTest(app=app):
+                    start = len(self.calls)
+                    self.script.append(httpx.ReadTimeout("read failed: Bearer diagnostic-token sk-test-key"))
+                    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://local") as client:
+                        with self.assertLogs(level="ERROR") as captured:
+                            result = await client.get("/v1/models")
+                    self.assertEqual(result.status_code, 502)
+                    diagnostic = result.text + "\n" + "\n".join(captured.output)
+                    self.assertIn("ReadTimeout: read failed", diagnostic)
+                    self.assertNotIn("diagnostic-token", diagnostic)
+                    self.assertNotIn("sk-test-key", diagnostic)
+                    self.assertEqual(len(self.calls), start + 1)
+
+    async def test_transport_retry_log_preserves_redacted_details(self):
+        self.script.extend([httpx.ConnectError("connect failed: Bearer diagnostic-token"), _complete()])
+        with self.assertLogs(proxy.logger, level="WARNING") as captured:
+            result = await proxy._send_with_transport_retry(
+                self.upstream, "POST", "https://upstream.invalid/v1/responses", {}, content=b"{}", max_retries=2,
+            )
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(len(self.calls), 2)
+        diagnostic = "\n".join(captured.output)
+        self.assertIn("ConnectError: connect failed", diagnostic)
+        self.assertIn("[redacted]", diagnostic)
+        self.assertNotIn("diagnostic-token", diagnostic)
+
     async def test_nonstream_read_timeout_closes_connection_before_retry(self):
         for endpoint in ("/v1/responses", "/v1/chat/completions"):
             with self.subTest(endpoint=endpoint):
@@ -240,6 +333,45 @@ class RecoveryRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status_code, 502)
         self.assertEqual(len(self.calls), 3)
         self.assertEqual(proxy.STATS["successful_recoveries"], 0)
+
+
+class ExceptionDescriptionTests(unittest.TestCase):
+    def test_blank_exception_messages_keep_the_type(self):
+        for error_type in (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ReadError, httpx.RemoteProtocolError):
+            for message in ("", " \t "):
+                with self.subTest(error_type=error_type.__name__, message=message):
+                    self.assertEqual(proxy.describe_exception(error_type(message)), error_type.__name__)
+
+    def test_explicit_cause_is_included_without_duplicates_or_recursion(self):
+        error = httpx.ConnectError("")
+        error.__cause__ = ConnectionResetError(10054, "Connection reset by peer")
+        description = proxy.describe_exception(error)
+        self.assertIn("ConnectError (caused by ConnectionResetError:", description)
+        self.assertIn("10054", description)
+        error = httpx.ReadTimeout("")
+        error.__cause__ = httpx.ReadTimeout("")
+        self.assertEqual(proxy.describe_exception(error), "ReadTimeout")
+        error.__cause__ = error
+        self.assertEqual(proxy.describe_exception(error), "ReadTimeout")
+
+    def test_exception_message_and_cause_redact_known_credentials(self):
+        error = httpx.ReadError("Bearer diagnostic-token sk-test-key local-secret fallback-secret desktop-secret")
+        error.__cause__ = OSError("upstream-secret")
+        with patch.object(proxy, "PROXY_AUTH_TOKEN", "local-secret"), patch.dict(os.environ, {
+            "CODEX_GATEWAY_API_KEY": "fallback-secret", "AGENTROUTER_API_KEY": "upstream-secret",
+            "CODEX_AGENTROUTER_GATEWAY_KEY": "desktop-secret",
+        }):
+            description = proxy.describe_exception(error)
+        self.assertIn("ReadError:", description)
+        self.assertIn("caused by OSError:", description)
+        for secret in ("diagnostic-token", "sk-test-key", "local-secret", "fallback-secret", "desktop-secret", "upstream-secret"):
+            self.assertNotIn(secret, description)
+
+    def test_suppressed_context_is_not_reported(self):
+        error = httpx.ReadTimeout("")
+        error.__context__ = OSError("unrelated exception")
+        error.__suppress_context__ = True
+        self.assertEqual(proxy.describe_exception(error), "ReadTimeout")
 
 
 class RetryHintTests(unittest.TestCase):
