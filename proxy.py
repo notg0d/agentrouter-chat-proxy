@@ -41,8 +41,9 @@ import re
 import socket
 import sys
 import time
-from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Tuple
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple, TypeVar
 
+import anyio
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -610,6 +611,51 @@ async def _client_disconnected(request: Request) -> bool:
     except Exception:
         return False
 
+
+class _ClientDisconnected(Exception):
+    """The downstream left; this is not a retryable upstream failure."""
+
+
+_T = TypeVar("_T")
+
+
+async def _run_unless_disconnected(
+    operation: Callable[[], Awaitable[_T]], request: Optional[Request],
+) -> _T:
+    """Watch an upstream operation before StreamingResponse owns cancellation."""
+    if request is None:
+        return await operation()
+    if await _client_disconnected(request):
+        raise _ClientDisconnected
+
+    task = asyncio.create_task(operation())
+    try:
+        while not task.done():
+            done, _ = await asyncio.wait({task}, timeout=0.25)
+            if done:
+                break
+            if await _client_disconnected(request):
+                raise _ClientDisconnected
+        return task.result()
+    except BaseException:
+        # Join the cancelled task, including HTTPcore's pool cleanup. A response
+        # can arrive in the disconnect/cancellation race; close it, not the pool.
+        task.cancel()
+        with anyio.CancelScope(shield=True):
+            result, = await asyncio.gather(task, return_exceptions=True)
+            if isinstance(result, httpx.Response):
+                await _close_upstream_response(result)
+        raise
+
+
+async def _close_upstream_response(resp: httpx.Response) -> None:
+    """Close without masking the original failure or retrying completed work."""
+    with anyio.CancelScope(shield=True):
+        try:
+            await resp.aclose()
+        except Exception as exc:
+            logger.warning("[Upstream Cleanup] %s", describe_exception(exc))
+
 async def _sleep_unless_disconnected(delay_s: float, request: Request) -> bool:
     """Sleeps up to delay_s in small slices; returns False if client disconnected."""
     if delay_s <= 0:
@@ -734,20 +780,91 @@ def redact_sensitive(text: str) -> str:
     return text
 
 
-def describe_exception(exc: BaseException) -> str:
-    """Return a non-empty, redacted exception summary without request or traceback data."""
+def _exception_summaries(exc: BaseException) -> List[str]:
+    """Collect bounded explicit causes and safe snapshots taken before cleanup."""
     def summarize(error: BaseException) -> str:
         message = str(error).strip()
         name = type(error).__name__
-        return f"{name}: {message}" if message else name
+        return redact_sensitive(f"{name}: {message}" if message else name)[:1024]
 
-    description = summarize(exc)
-    cause = exc.__cause__
-    if cause is not None and cause is not exc:
-        cause_description = summarize(cause)
-        if cause_description != description:
-            description += f" (caused by {cause_description})"
-    return redact_sensitive(description)
+    # HTTPX -> httpcore -> AnyIO often repeats an empty error name before the
+    # actual socket/TLS cause. Skip duplicate summaries, not their descendants.
+    summaries = []
+    seen_errors = set()
+    seen_summaries = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen_errors and len(seen_errors) < 16:
+        seen_errors.add(id(current))
+        saved = getattr(current, "_proxy_cause_summaries", ())
+        saved = saved[:16] if isinstance(saved, tuple) else ()
+        for summary in (summarize(current), *saved):
+            if isinstance(summary, str):
+                summary = redact_sensitive(summary)[:1024]
+                if summary not in seen_summaries:
+                    seen_summaries.add(summary)
+                    summaries.append(summary)
+        # Only explicit causes: implicit context may be unrelated or suppressed.
+        current = current.__cause__
+    if current is not None and id(current) not in seen_errors:
+        summaries.append("cause chain truncated")
+    return summaries
+
+
+def describe_exception(exc: BaseException) -> str:
+    """Return a non-empty, redacted exception summary without request or traceback data."""
+    summaries = _exception_summaries(exc)
+    description = summaries[0]
+    if len(summaries) > 1:
+        description += f" (caused by {' -> '.join(summaries[1:])})"
+    return description
+
+
+@dataclass
+class UpstreamAttemptDiagnostics:
+    """Keep safe per-attempt timing/stages, never trace headers or payloads."""
+    started_at: float = field(default_factory=time.monotonic)
+    phase: str = "send_request"
+    new_connection: Optional[bool] = None
+    status_code: Optional[int] = None
+
+    async def trace(self, event: str, info: dict) -> None:
+        operation = event.rsplit(".", 2)
+        if len(operation) != 3 or operation[2] not in ("started", "failed"):
+            return
+        if operation[0] == "connection":
+            phase = {"connect_tcp": "connect_tcp", "start_tls": "tls_handshake"}.get(operation[1])
+            if phase is not None:
+                self.new_connection = True
+        elif operation[0] in ("http11", "http2"):
+            phase = {
+                "send_request_headers": "request_headers",
+                "send_request_body": "request_body",
+                "receive_response_headers": "response_headers",
+                "receive_response_body": "response_body",
+            }.get(operation[1])
+            if phase is not None and self.new_connection is None:
+                self.new_connection = False
+        else:
+            return
+        if phase is None:
+            return
+        self.phase = phase
+        if operation[2] == "failed":
+            error = info.get("exception")
+            if isinstance(error, Exception):
+                # HTTPcore re-raises with `from None` after pool/stream cleanup,
+                # erasing __cause__. Keep redacted strings on this error before
+                # that happens, so HTTPX wrapping and later SSE reads retain them.
+                # Never retain info, headers, response bodies, or extra exceptions.
+                error._proxy_cause_summaries = tuple(_exception_summaries(error)[1:17])
+
+    def summary(self) -> str:
+        detail = f"phase={self.phase} elapsed={time.monotonic() - self.started_at:.2f}s"
+        if self.new_connection is not None:
+            detail += " connection=" + ("new" if self.new_connection else "reused")
+        if self.status_code is not None:
+            detail += f" http_status={self.status_code}"
+        return detail
 
 
 def sanitize_responses_payload(payload: dict) -> dict:
@@ -832,14 +949,16 @@ async def _send_with_transport_retry(
     params: Optional[dict] = None,
     stream: bool = False,
     max_retries: int = 2,
+    diagnostics: Optional[UpstreamAttemptDiagnostics] = None,
+    request: Optional[Request] = None,
 ) -> httpx.Response:
     """
-    Sends an HTTP request with dedicated retries on connection, DNS, and transport errors.
-    This guarantees that momentary WiFi drops, DNS timeouts, or server disconnects
-    do not kill the session or exhaust application recovery attempts.
+    Send with bounded transport retries; callers can own the budget with max_retries=1.
+    Preserve response ownership until streaming ends or a buffered read completes.
     """
     last_exc = None
     for attempt in range(1, max_retries + 1):
+        attempt_diagnostics = diagnostics if attempt == 1 and diagnostics is not None else UpstreamAttemptDiagnostics()
         try:
             req = client.build_request(
                 method=method,
@@ -847,9 +966,17 @@ async def _send_with_transport_retry(
                 headers=headers,
                 params=params,
                 content=content,
+                extensions={"trace": attempt_diagnostics.trace},
             )
-            return await client.send(req, stream=stream)
+            resp = await _run_unless_disconnected(lambda: client.send(req, stream=True), request)
+            attempt_diagnostics.status_code = resp.status_code
+            if not stream:
+                attempt_diagnostics.phase = "response_body"
+                await _read_and_close_response(resp, request)
+            return resp
         except RETRYABLE_TRANSPORT_ERRORS as exc:
+            if request is not None and await _client_disconnected(request):
+                raise _ClientDisconnected from None
             if not _retryable_transport_error(exc):
                 raise
             last_exc = exc
@@ -860,18 +987,21 @@ async def _send_with_transport_retry(
                     attempt, max_retries, describe_exception(exc), backoff_s,
                 )
                 STATS["transport_retries"] += 1
-                await asyncio.sleep(backoff_s)
+                if request is None:
+                    await asyncio.sleep(backoff_s)
+                elif not await _sleep_unless_disconnected(backoff_s, request):
+                    raise _ClientDisconnected
             else:
                 raise
     raise last_exc
 
 
-async def _read_and_close_response(resp: httpx.Response) -> bytes:
+async def _read_and_close_response(resp: httpx.Response, request: Optional[Request] = None) -> bytes:
     """Release the pool connection even when reading an upstream body times out."""
     try:
-        return await resp.aread()
+        return await _run_unless_disconnected(resp.aread, request)
     finally:
-        await resp.aclose()
+        await _close_upstream_response(resp)
 
 # ----------------------------------------------------------------------------
 # FastAPI Application
@@ -1019,14 +1149,39 @@ async def _close_sse_producer(
     upstream_response: Optional[httpx.Response],
     producer_task: Optional[asyncio.Task],
 ) -> None:
-    if producer_task is not None and not producer_task.done():
-        producer_task.cancel()
-        await asyncio.gather(producer_task, return_exceptions=True)
-    if upstream_response is not None:
+    # StreamingResponse cancels an AnyIO scope when the downstream disconnects.
+    # Shield both the producer join and close so cancellation cannot strand a
+    # connection or leave a queue-blocked producer attached to the shared client.
+    with anyio.CancelScope(shield=True):
+        if producer_task is not None and not producer_task.done():
+            producer_task.cancel()
+            await asyncio.gather(producer_task, return_exceptions=True)
+        if upstream_response is not None:
+            await _close_upstream_response(upstream_response)
+
+
+class _UpstreamStreamingResponse(StreamingResponse):
+    """Own upstream cleanup even when downstream send fails at a yielded chunk."""
+
+    def __init__(self, content, *, upstream_response: httpx.Response, producer_task: Optional[asyncio.Task], **kwargs):
+        super().__init__(content, **kwargs)
+        self.upstream_response = upstream_response
+        self.producer_task = producer_task
+
+    async def __call__(self, scope, receive, send) -> None:
         try:
-            await upstream_response.aclose()
-        except Exception:
-            pass
+            await super().__call__(scope, receive, send)
+        finally:
+            # Starlette may stop at `send()` while the generator is suspended at
+            # `yield`, so its own finally is not sufficient. Also cover a send
+            # failure before the generator starts: priming already owns a reader.
+            with anyio.CancelScope(shield=True):
+                try:
+                    await self.body_iterator.aclose()
+                except Exception as exc:
+                    logger.warning("[Stream Cleanup] %s", describe_exception(exc))
+                finally:
+                    await _close_sse_producer(self.upstream_response, self.producer_task)
 
 
 def _parse_sse_frame(raw_frame: bytes) -> Tuple[str, Optional[Dict[str, Any]], str]:
@@ -1246,7 +1401,10 @@ async def _prime_responses_sse(
                         return res
                 if ((producer_exc and not _retryable_transport_error(producer_exc[0]))
                         or (not producer_exc and not RETRY_AMBIGUOUS_ERRORS)):
-                    return await abort_result("fatal_error", "upstream_stream_interrupted", "Upstream stream ended before output; no retry was permitted")
+                    message = "Upstream stream ended before output; no retry was permitted"
+                    if producer_exc:
+                        message += f". Cause: {describe_exception(producer_exc[0])}"
+                    return await abort_result("fatal_error", "upstream_stream_interrupted", message)
                 err_note = describe_exception(producer_exc[0]) if producer_exc else "Upstream SSE stream closed before emitting content"
                 return await abort_result("retry_transient", "empty_stream", err_note)
 
@@ -1441,11 +1599,12 @@ async def handle_responses(request: Request):
     headers = _clean_response_headers(result.response.headers)
     if result.prime is not None:
         prime = result.prime
-        return StreamingResponse(
+        return _UpstreamStreamingResponse(
             _stream_generator(
                 result.response, primed_chunks=prime.primed_chunks, remainder=prime.remainder,
                 queue=prime.queue, producer_task=prime.producer_task, producer_exc=prime.producer_exc,
-            ), status_code=200, headers=headers, media_type="text/event-stream",
+            ), upstream_response=result.response, producer_task=prime.producer_task,
+            status_code=200, headers=headers, media_type="text/event-stream",
         )
     return Response(content=result.body, status_code=result.response.status_code, headers=headers)
 
@@ -1565,6 +1724,7 @@ async def recover_responses_request(
                 "message": "Converted request exceeds PROXY_MAX_BODY_BYTES",
             }})
 
+        diagnostics = UpstreamAttemptDiagnostics()
         try:
             client = get_shared_client()
             resp = await _send_with_transport_retry(
@@ -1575,8 +1735,11 @@ async def recover_responses_request(
                 content=req_content,
                 stream=True,
                 max_retries=1,  # Outer retry loop owns the budget; avoid nested retries.
+                diagnostics=diagnostics,
+                request=request,
             )
 
+            diagnostics.status_code = resp.status_code
             resp_headers = _clean_response_headers(resp.headers)
             content_type = resp.headers.get("content-type", "")
 
@@ -1643,7 +1806,8 @@ async def recover_responses_request(
                 )
 
             if resp.status_code == 200:
-                body = await _read_and_close_response(resp)
+                diagnostics.phase = "response_body"
+                body = await _read_and_close_response(resp, request)
                 parsed_body: Optional[Dict[str, Any]] = None
                 try:
                     obj = json.loads(body.decode("utf-8", errors="replace"))
@@ -1685,7 +1849,8 @@ async def recover_responses_request(
                 return RecoveredResponses(response=resp, body=body)
 
             # Non-200 HTTP status
-            err_body = await _read_and_close_response(resp)
+            diagnostics.phase = "response_body"
+            err_body = await _read_and_close_response(resp, request)
             err_text = err_body.decode("utf-8", errors="replace")
 
             parsed_error = None
@@ -1729,9 +1894,15 @@ async def recover_responses_request(
             logger.error("[Forwarding Error %d] %s", resp.status_code, redact_sensitive(err_text)[:200])
             return Response(content=err_body, status_code=resp.status_code, headers=resp_headers)
 
+        except _ClientDisconnected:
+            logger.info("[Client Disconnected] Upstream request cancelled (%s)", diagnostics.summary())
+            return Response(status_code=499)
         except RETRYABLE_TRANSPORT_ERRORS as exc:
+            if await _client_disconnected(request):
+                logger.info("[Client Disconnected] Upstream request cancelled (%s)", diagnostics.summary())
+                return Response(status_code=499)
             diagnostic = describe_exception(exc)
-            logger.error("[Attempt Exception] %s", diagnostic)
+            logger.error("[Attempt Exception] %s (%s)", diagnostic, diagnostics.summary())
             last_failure_response = JSONResponse(
                 status_code=502,
                 content={"error": {"message": f"Proxy upstream communication error: {diagnostic}", "type": "proxy_error"}},
@@ -1742,6 +1913,8 @@ async def recover_responses_request(
             if should_retry:
                 STATS["transport_retries"] += 1
                 continue
+            if await _client_disconnected(request):
+                return Response(status_code=499)
             return last_failure_response
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
@@ -1769,12 +1942,16 @@ async def passthrough_handler(request: Request, path: str):
             content=body,
             stream=False,
             max_retries=2,
+            request=request,
         )
         resp_headers = {
             k: v for k, v in resp.headers.items()
             if k.lower() not in STRIP_RESPONSE_HEADERS
         }
         return Response(content=resp.content, status_code=resp.status_code, headers=resp_headers)
+    except _ClientDisconnected:
+        logger.info("[Client Disconnected] Passthrough request cancelled")
+        return Response(status_code=499)
     except Exception as exc:
         diagnostic = describe_exception(exc)
         logger.error("[Passthrough Error] %s -> %s: %s", request.method, target_url, diagnostic)

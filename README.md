@@ -283,6 +283,10 @@ An oversized initial buffer produces HTTP `502` with `upstream_sse_prime_too_lar
 SSE heartbeats help keep the client connection active.
 They cannot make the upstream server supply output.
 
+The proxy cancels pending upstream work when the downstream client disconnects.
+Streaming response cleanup also runs if transmission fails before the first output byte or during a chunk.
+See [Transport reliability](docs/transport-reliability.md) for source comparisons, diagnostics, limits, and fault tests.
+
 ## Proxy configuration
 
 1. Copy `.env.example` to `.env`.

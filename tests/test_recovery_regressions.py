@@ -10,11 +10,14 @@ from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 import json
 import os
+import ssl
 import sys
 import time
 import unittest
 from unittest.mock import patch
 
+import anyio
+import httpcore
 import httpx
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -49,6 +52,14 @@ def _complete():
         "id": "resp_new", "status": "completed",
         "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "OK"}]}],
     })
+
+
+def _nested_read_error(message="Connection reset by peer"):
+    cause = ConnectionResetError(10054, message)
+    for error in (anyio.BrokenResourceError(), httpcore.ReadError(""), httpx.ReadError("")):
+        error.__cause__ = cause
+        cause = error
+    return cause
 
 
 COMPLETED = b'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n'
@@ -206,9 +217,93 @@ class RecoveryRegressionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(self.calls), start + 3)
                 attempts = [record.getMessage() for record in captured.records if record.levelname == "ERROR"]
                 retries = [record.getMessage() for record in captured.records if "Retrying" in record.getMessage()]
-                self.assertEqual(attempts, ["[Attempt Exception] ReadTimeout"] * 3)
+                self.assertEqual(len(attempts), 3)
+                self.assertTrue(all(message.startswith("[Attempt Exception] ReadTimeout (") for message in attempts))
+                self.assertTrue(all("phase=send_request" in message for message in attempts))
                 self.assertEqual(len(retries), 2)
                 self.assertTrue(all(message.endswith(": ReadTimeout") for message in retries))
+
+    async def test_nested_read_error_logs_phase_and_cause_without_extra_retries(self):
+        for endpoint in ("/v1/responses", "/v1/chat/completions"):
+            with self.subTest(endpoint=endpoint):
+                start = len(self.calls)
+                error = _nested_read_error("reset: Bearer diagnostic-token sk-test-key")
+                self.script.extend([error, _complete()])
+                with self.assertLogs(proxy.logger, level="WARNING") as captured:
+                    result = await self.local.post(endpoint, json=self.request_body(endpoint))
+                self.assertEqual(result.status_code, 200)
+                self.assertEqual(len(self.calls), start + 2)
+                diagnostic = "\n".join(captured.output)
+                self.assertIn("BrokenResourceError", diagnostic)
+                self.assertIn("ConnectionResetError", diagnostic)
+                self.assertIn("10054", diagnostic)
+                self.assertIn("phase=send_request", diagnostic)
+                self.assertIn("elapsed=", diagnostic)
+                self.assertNotIn("diagnostic-token", diagnostic)
+                self.assertNotIn("sk-test-key", diagnostic)
+
+    async def test_response_body_read_error_logs_http_status_and_closes_stream(self):
+        for endpoint in ("/v1/responses", "/v1/chat/completions"):
+            with self.subTest(endpoint=endpoint):
+                start = len(self.calls)
+                stream = _Stream([_nested_read_error()])
+                self.script.extend([
+                    httpx.Response(200, headers={"content-type": "application/json"}, stream=stream),
+                    _complete(),
+                ])
+                with self.assertLogs(proxy.logger, level="WARNING") as captured:
+                    result = await self.local.post(endpoint, json=self.request_body(endpoint))
+                self.assertEqual(result.status_code, 200)
+                self.assertEqual(len(self.calls), start + 2)
+                self.assertTrue(stream.closed)
+                diagnostic = "\n".join(captured.output)
+                self.assertIn("phase=response_body", diagnostic)
+                self.assertIn("http_status=200", diagnostic)
+                self.assertIn("ConnectionResetError", diagnostic)
+
+    async def test_precommit_read_error_preserves_cause_when_retries_are_disabled(self):
+        with patch.object(proxy, "RETRY_AMBIGUOUS_ERRORS", False):
+            for endpoint in ("/v1/responses", "/v1/chat/completions"):
+                with self.subTest(endpoint=endpoint):
+                    start = len(self.calls)
+                    stream = _Stream([_nested_read_error("reset: Bearer diagnostic-token")])
+                    self.script.append(httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=stream))
+                    result = await self.local.post(endpoint, json=self.request_body(endpoint, stream=True))
+                    self.assertEqual(result.status_code, 502)
+                    self.assertIn("no retry was permitted", result.text)
+                    self.assertIn("ConnectionResetError", result.text)
+                    self.assertNotIn("diagnostic-token", result.text)
+                    self.assertEqual(len(self.calls), start + 1)
+                    self.assertTrue(stream.closed)
+
+    async def test_trace_records_safe_stage_without_logging_trace_payload(self):
+        for fresh_connection in (False, True):
+            with self.subTest(fresh_connection=fresh_connection):
+                diagnostics = proxy.UpstreamAttemptDiagnostics()
+
+                async def respond(request):
+                    trace = request.extensions["trace"]
+                    secret_info = {"headers": [(b"authorization", b"Bearer diagnostic-token")]}
+                    if fresh_connection:
+                        await trace("connection.connect_tcp.started", secret_info)
+                        await trace("connection.start_tls.started", secret_info)
+                    await trace("http11.send_request_headers.started", secret_info)
+                    await trace("http11.send_request_body.started", secret_info)
+                    await trace("http11.receive_response_headers.started", secret_info)
+                    await trace("http11.response_closed.started", secret_info)
+                    raise _nested_read_error()
+
+                async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+                    with self.assertRaises(httpx.ReadError):
+                        await proxy._send_with_transport_retry(
+                            client, "POST", "https://upstream.invalid/v1/responses", {},
+                            content=b"{}", max_retries=1, diagnostics=diagnostics,
+                        )
+                summary = diagnostics.summary()
+                self.assertIn("phase=response_headers", summary)
+                self.assertIn("connection=new" if fresh_connection else "connection=reused", summary)
+                self.assertNotIn("diagnostic-token", summary)
+                self.assertNotIn("authorization", summary)
 
     async def test_communication_error_details_are_redacted_in_logs_and_responses(self):
         with patch.object(proxy, "RETRY_AMBIGUOUS_ERRORS", False):
@@ -353,6 +448,52 @@ class ExceptionDescriptionTests(unittest.TestCase):
         self.assertEqual(proxy.describe_exception(error), "ReadTimeout")
         error.__cause__ = error
         self.assertEqual(proxy.describe_exception(error), "ReadTimeout")
+
+    def test_nested_httpx_cause_chain_reaches_socket_error(self):
+        description = proxy.describe_exception(_nested_read_error())
+        self.assertTrue(description.startswith("ReadError (caused by BrokenResourceError -> ConnectionResetError:"))
+        self.assertEqual(description.count("ReadError"), 1)
+        self.assertIn("10054", description)
+        self.assertIn("Connection reset by peer", description)
+
+    def test_nested_tls_read_error_preserves_ssl_cause(self):
+        error = _nested_read_error()
+        error.__cause__.__cause__.__cause__ = ssl.SSLEOFError(8, "Unexpected TLS EOF")
+        description = proxy.describe_exception(error)
+        self.assertIn("SSLEOFError", description)
+        self.assertIn("Unexpected TLS EOF", description)
+
+    def test_duplicate_wrappers_do_not_hide_deeper_redacted_details(self):
+        error = _nested_read_error("Bearer diagnostic-token sk-test-key desktop-secret")
+        with patch.dict(os.environ, {"CODEX_AGENTROUTER_GATEWAY_KEY": "desktop-secret"}):
+            description = proxy.describe_exception(error)
+        self.assertIn("ConnectionResetError", description)
+        self.assertIn("[redacted]", description)
+        for secret in ("diagnostic-token", "sk-test-key", "desktop-secret"):
+            self.assertNotIn(secret, description)
+
+    def test_multi_exception_cycle_is_bounded(self):
+        error = httpx.ReadError("")
+        cause = OSError("socket failed")
+        error.__cause__ = cause
+        cause.__cause__ = error
+        self.assertEqual(proxy.describe_exception(error), "ReadError (caused by OSError: socket failed)")
+
+    def test_excessive_cause_depth_is_marked_and_bounded(self):
+        error = httpx.ReadError("")
+        current = error
+        for index in range(30):
+            current.__cause__ = OSError(f"layer-{index}")
+            current = current.__cause__
+        description = proxy.describe_exception(error)
+        self.assertIn("cause chain truncated", description)
+        self.assertNotIn("layer-29", description)
+        self.assertLess(description.count("layer-"), 30)
+
+    def test_unsuppressed_implicit_context_is_not_reported(self):
+        error = httpx.ReadError("")
+        error.__context__ = OSError("unrelated previous error")
+        self.assertEqual(proxy.describe_exception(error), "ReadError")
 
     def test_exception_message_and_cause_redact_known_credentials(self):
         error = httpx.ReadError("Bearer diagnostic-token sk-test-key local-secret fallback-secret desktop-secret")

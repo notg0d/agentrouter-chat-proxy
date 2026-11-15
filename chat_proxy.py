@@ -794,11 +794,12 @@ async def handle_chat_completions(request: Request):
     resp_headers = proxy._clean_response_headers(result.response.headers)
     if result.prime is not None:
         prime = result.prime
-        return StreamingResponse(
+        return proxy._UpstreamStreamingResponse(
             _translate_responses_stream(
                 result.response, primed_chunks=prime.primed_chunks, remainder=prime.remainder,
                 queue=prime.queue, producer_task=prime.producer_task, producer_exc=prime.producer_exc, model=model,
-            ), status_code=200, headers={**resp_headers, "cache-control": "no-cache"}, media_type="text/event-stream",
+            ), upstream_response=result.response, producer_task=prime.producer_task,
+            status_code=200, headers={**resp_headers, "cache-control": "no-cache"}, media_type="text/event-stream",
         )
     try:
         parsed = json.loads(result.body)
@@ -833,12 +834,16 @@ async def passthrough_handler(request: Request, path: str):
             content=body,
             stream=False,
             max_retries=2,
+            request=request,
         )
         resp_headers = {
             k: v for k, v in resp.headers.items()
             if k.lower() not in proxy.STRIP_RESPONSE_HEADERS
         }
         return Response(content=resp.content, status_code=resp.status_code, headers=resp_headers)
+    except proxy._ClientDisconnected:
+        logger.info("[Client Disconnected] Passthrough request cancelled")
+        return Response(status_code=499)
     except Exception as exc:
         diagnostic = proxy.describe_exception(exc)
         logger.error("[Passthrough Error] %s -> %s: %s", request.method, target_url, diagnostic)
