@@ -741,6 +741,7 @@ async def health():
         "supported_apis": ["chat.completions", "responses"],
         "proxy_auth_enabled": bool(proxy.PROXY_AUTH_TOKEN),
         "max_body_bytes": proxy.MAX_BODY_BYTES,
+        "transport_recovery_wait_seconds": proxy.MAX_TRANSPORT_RECOVERY_WAIT_S,
         "listen": f"{LISTEN_HOST}:{PORT}",
         "uptime_seconds": round(time.time() - STATS["start_time"], 1),
         "upstream": UPSTREAM,

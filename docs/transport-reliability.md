@@ -4,9 +4,16 @@ The proxy can recover from some temporary upstream failures. It cannot guarantee
 
 ## Recovery rules
 
-- Responses and translated Chat requests use one outer retry budget. The transport helper sends one attempt per outer iteration.
+- Responses and translated Chat requests use one outer retry loop and one shared retry count.
+- The transport helper sends one attempt per outer iteration.
 - Generic API forwarding permits two transport attempts, including the initial attempt.
-- Retries preserve the existing timeout, retry-count, and recovery-budget settings.
+- Connection and read timeouts remain unchanged. `PROXY_MAX_TRANSIENT_RETRIES` still limits the total transient retry count.
+- `PROXY_MAX_TRANSPORT_RECOVERY_WAIT_S` sets a separate transport recovery window. It defaults to 90 seconds.
+- This window starts at the first retryable transport failure. Repeated failures do not reset it.
+- The initial connection or response-header wait does not consume the transport recovery window.
+- `PROXY_MAX_RATE_LIMIT_WAIT_S` still controls rate-limit and server-error recovery from the initial request launch.
+- Shared cooldowns remain in effect. HTTP errors cannot start a fresh transport recovery window.
+- These windows limit retry delays and new attempt launches. They do not cancel an in-flight attempt at expiry.
 - Known authentication, billing, quota, invalid-input, and content-policy errors do not receive automatic retries.
 - Read and write failures can occur after AgentRouter accepts work. Automatic retries can produce duplicate work or additional charges.
 - `PROXY_RETRY_AMBIGUOUS_ERRORS=0` disables retries for ambiguous transport errors, empty streams, and initial SSE timeouts.
@@ -15,6 +22,24 @@ The proxy can recover from some temporary upstream failures. It cannot guarantee
 - After downstream response headers, the proxy does not replay the request, partial output, or tool calls.
 
 These options do not provide an exactly-once guarantee. TCP keep-alive and downstream SSE heartbeats cannot repair an upstream outage.
+
+### Same-session error guidance
+
+When transport recovery stops, HTTP `502` includes `upstream_transport_retries_exhausted` and the failure cause.
+With automatic transport retries disabled, the code is `upstream_transport_error`.
+Both errors explain that a retry can use the same OpenCode session.
+The proxy does not read or change local session data.
+
+Content-policy rejections remain non-retryable.
+Before client response headers, the proxy preserves upstream error fields and adds `retryable: false` and guidance.
+It includes a request ID when the upstream error or headers supply one.
+Non-`200` upstream HTTP statuses remain unchanged.
+Initial HTTP `200` JSON or SSE content rejections become HTTP `400`, not a successful completion or temporary HTTP `502`.
+After client response headers, the proxy forwards upstream errors without replaying the request.
+It never activates history sanitization for a content-policy rejection.
+
+Content-rejection logs contain counts and an available request ID, not prompts, image URLs, or quoted error content.
+The proxy cannot identify which content caused a generic rejection.
 
 ## Disconnects and connection ownership
 
@@ -98,6 +123,8 @@ python -m unittest discover -s tests -p test_transport_reliability.py -v
 These tests use mocked transports and temporary loopback servers. They do not send model requests or require upstream credentials.
 Fault cases include cause suppression, truncated bodies, stalled header waits, cancellation races, downstream transmission failures, and concurrent streams.
 Existing recovery tests cover retry limits, permanent errors, and the no-replay rule after partial output or tool activity.
+Recovery tests also simulate a 142.4-second initial failure, fixed transport-window expiry, and mixed HTTP and transport errors.
+Content tests cover preserved request IDs, HTTP and initial SSE rejections, unchanged input, and safe diagnostic counts.
 
 ## Activation
 

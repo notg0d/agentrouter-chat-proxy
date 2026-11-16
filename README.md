@@ -236,6 +236,19 @@ By default, the proxy also sends requests again after connection, read, or conne
 It uses the same recovery limits for HTTP `408`, `500`, `502`, `503`, and `504`.
 Connection pooling, TCP keep-alive, and DNS fallback help with transport errors.
 
+Transport recovery has a separate window, controlled by `PROXY_MAX_TRANSPORT_RECOVERY_WAIT_S`.
+The default is `90` seconds after the first retryable transport failure.
+The initial connection or response-header wait does not consume this window.
+Repeated transport failures do not reset the window.
+Transport failures, server errors, and rate limits still share one retry count.
+Shared rate-limit delays remain in effect during transport recovery.
+This window limits retry delays and new attempt launches, not the duration of an in-flight attempt.
+
+When transport recovery stops, the proxy returns HTTP `502` with `upstream_transport_retries_exhausted`.
+With automatic retries disabled, it returns `upstream_transport_error`.
+The error includes the failure cause and same-session retry guidance.
+These errors do not require a new OpenCode session.
+
 Known authentication, exhausted-quota, billing, invalid-input, and policy errors are not retried.
 `no available channel` is also treated as a permanent error.
 These errors do not start the shared rate-limit delay, even when their HTTP status is `429` or `5xx`.
@@ -264,6 +277,27 @@ If `rate_limit_exceeded` errors continue:
 4. Write to AgentRouter for more token capacity.
 
 The API conversion does not remove token rate limits.
+
+### Content rejections
+
+`content-blocked` means the upstream server rejected the request content.
+It is not a connection failure.
+The proxy does not retry this rejection, rewrite the prompt, or remove history to address it.
+
+Before client response headers, the error includes:
+
+- The upstream error code, type, and message.
+- The request ID, when available in the upstream error or headers.
+- `retryable: false` and guidance to review the request or contact AgentRouter.
+
+The proxy preserves non-`200` upstream HTTP statuses.
+An initial HTTP `200` JSON or SSE content rejection becomes HTTP `400`.
+It is not reported as a successful completion or a temporary HTTP `502` failure.
+After client response headers, upstream errors continue through the stream without a retry.
+
+The `[Content Rejected]` log includes request size, input-item count, image count, and an available request ID.
+It does not include prompts, image URLs, or error text that could quote rejected content.
+The proxy cannot identify the rejected content from a generic error code alone.
 
 ### Interrupted streams
 
@@ -314,7 +348,8 @@ Other users can read keys in repository files.
 | `PROXY_MAX_SSE_PRIME_BYTES` | `8388608` | Maximum initial SSE buffer: 8 MiB |
 | `PROXY_RETRY_ON_5XX` | `1` | Retry temporary server errors before client headers |
 | `PROXY_RETRY_AMBIGUOUS_ERRORS` | `1` | Retry ambiguous transport failures and empty or stalled initial streams |
-| `PROXY_MAX_RATE_LIMIT_WAIT_S` | `90` | Recovery budget in seconds |
+| `PROXY_MAX_RATE_LIMIT_WAIT_S` | `90` | Rate-limit and server-error recovery budget, from the initial request launch, in seconds |
+| `PROXY_MAX_TRANSPORT_RECOVERY_WAIT_S` | `90` | Transport recovery window, from the first retryable transport failure, in seconds |
 | `PROXY_MAX_TRANSIENT_RETRIES` | `6` | Maximum transient retries, not the initial request |
 | `PROXY_RATE_LIMIT_BASE_S` | `2` | Base value for calculated rate-limit delays in seconds |
 | `PROXY_RATE_LIMIT_MAX_DELAY_S` | `15` | Maximum calculated retry delay in seconds, not an upstream-delay limit |
@@ -325,8 +360,8 @@ Other users can read keys in repository files.
 | `PROXY_SSE_PRIME_CREATED_GRACE_S` | `3` | Initial inspection period after an SSE setup event, in seconds |
 | `PROXY_MAX_IMAGES` | `35` | Maximum images in native Responses or translated Chat requests |
 
-The recovery budget is the time available for retries and shared retry delays.
-It is not a total request timeout.
+The recovery budgets limit retries and shared retry delays.
+They are not total request timeouts.
 Connection, read, and client timeouts have different limits.
 If the upstream delay is longer than the remaining recovery budget, the proxy sends HTTP `429` with `Retry-After`.
 Make sure that the client timeout is longer than the recovery delay.
@@ -407,6 +442,7 @@ The health data on port `8789` include these fields:
 | `supported_apis` | `chat.completions` and `responses` |
 | `proxy_auth_enabled` | Whether local token authentication is enabled |
 | `max_body_bytes` | Configured request body limit |
+| `transport_recovery_wait_seconds` | Configured transport recovery window after the first retryable transport failure |
 | `stats.responses_requests` | Number of native Responses requests |
 | `stats.chat_requests` | Number of translated Chat Completions requests |
 | `responses_stats` | Shared recovery and request-guard counters |

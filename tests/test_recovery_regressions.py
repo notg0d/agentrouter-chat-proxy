@@ -67,6 +67,27 @@ DELTA = b'event: response.output_text.delta\ndata: {"type":"response.output_text
 MISMATCH = "The requested item was created under a different Azure OpenAI resource. Use the same resource that created the item to access it."
 
 
+class _Clock:
+    """Advance proxy time without changing asyncio's real clock or sleeping."""
+    time = staticmethod(time.time)
+
+    def __init__(self):
+        self.now = 100.0
+
+    def monotonic(self):
+        return self.now
+
+    async def sleep(self, delay, request):
+        self.now += delay
+        return True
+
+    def after(self, delay, result):
+        def respond(request):
+            self.now += delay
+            return result
+        return respond
+
+
 class RecoveryRegressionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.script = []
@@ -76,7 +97,7 @@ class RecoveryRegressionTests(unittest.IsolatedAsyncioTestCase):
         proxy._SHARED_CLIENT = self.upstream
         self.settings = patch.multiple(
             proxy, RATE_LIMIT_BASE_DELAY_S=0.01, RATE_LIMIT_MAX_DELAY_S=0.02,
-            MAX_RATE_LIMIT_WAIT_S=2.0, MAX_TRANSIENT_RETRIES=2,
+            MAX_RATE_LIMIT_WAIT_S=2.0, MAX_TRANSPORT_RECOVERY_WAIT_S=2.0, MAX_TRANSIENT_RETRIES=2,
             RECOVERY_STAGGER_S=0.005, RETRY_DELAY_MS=1,
             SSE_PRIME_CREATED_GRACE_S=0.05, SSE_PRIME_FIRST_TIMEOUT_S=0.1,
         )
@@ -105,6 +126,8 @@ class RecoveryRegressionTests(unittest.IsolatedAsyncioTestCase):
         if not self.script:
             raise AssertionError("Unexpected extra upstream attempt")
         item = self.script.pop(0)
+        if callable(item):
+            item = item(request)
         if isinstance(item, Exception):
             raise item
         return item
@@ -204,6 +227,228 @@ class RecoveryRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status_code, 502)
         self.assertEqual(len(self.calls), 3)  # Initial send + 2, not 5 nested attempts each.
 
+    async def test_slow_first_transport_failure_gets_its_own_recovery_budget(self):
+        for endpoint in ("/v1/responses", "/responses", "/v1/chat/completions", "/chat/completions"):
+            for stream in (False, True):
+                with self.subTest(endpoint=endpoint, stream=stream):
+                    proxy.reset_rate_limit_state()
+                    start = len(self.calls)
+                    clock = _Clock()
+                    failure = _sse(httpx.ReadError("broken stream")) if stream else _nested_read_error()
+                    if not stream:
+                        failure.__cause__.__cause__.__cause__ = OSError("[WinError 121] The semaphore timeout period has expired")
+                    success = _sse(COMPLETED) if stream else _complete()
+                    self.script.extend([clock.after(142.4, failure), success])
+                    payload = self.request_body(endpoint, stream=stream)
+                    history = [
+                        {"role": "user", "content": "Earlier question"},
+                        {"role": "assistant", "content": "Earlier answer"},
+                        {"role": "user", "content": "Continue the same task"},
+                    ]
+                    payload["messages" if "chat" in endpoint else "input"] = history
+                    if "chat" not in endpoint:
+                        payload["previous_response_id"] = "resp_existing_session"
+                    with patch.object(proxy, "time", clock), patch.object(proxy, "_sleep_unless_disconnected", clock.sleep), patch.multiple(
+                        proxy, MAX_RATE_LIMIT_WAIT_S=90.0, MAX_TRANSPORT_RECOVERY_WAIT_S=90.0,
+                    ):
+                        result = await self.local.post(endpoint, json=payload)
+                    self.assertEqual(result.status_code, 200)
+                    self.assertEqual(len(self.calls), start + 2)
+                    self.assertEqual(self.calls[start], self.calls[start + 1])
+                    self.assertNotIn("broken stream", result.text)
+
+    async def test_transport_recovery_deadline_does_not_reset_after_each_failure(self):
+        for endpoint in ("/v1/responses", "/v1/chat/completions"):
+            with self.subTest(endpoint=endpoint):
+                start = len(self.calls)
+                clock = _Clock()
+                self.script.extend([clock.after(delay, httpx.ReadError("network read failed")) for delay in (142.4, 45.0, 45.0)])
+                with patch.object(proxy, "time", clock), patch.object(proxy, "_sleep_unless_disconnected", clock.sleep), patch.multiple(
+                    proxy, MAX_RATE_LIMIT_WAIT_S=90.0, MAX_TRANSPORT_RECOVERY_WAIT_S=90.0, MAX_TRANSIENT_RETRIES=6,
+                ):
+                    result = await self.local.post(endpoint, json=self.request_body(endpoint))
+                self.assertEqual(result.status_code, 502)
+                self.assertEqual(len(self.calls), start + 3)
+                self.assertEqual(result.json()["error"]["retries"], 2)
+                self.assertEqual(result.json()["error"]["code"], "upstream_transport_retries_exhausted")
+                self.assertIn("same OpenCode session", result.json()["error"]["message"])
+
+    async def test_http_errors_do_not_start_a_fresh_transport_budget(self):
+        for status in (429, 503):
+            with self.subTest(status=status):
+                proxy.reset_rate_limit_state()
+                start = len(self.calls)
+                clock = _Clock()
+                code = "rate_limit_exceeded" if status == 429 else "server_error"
+                self.script.append(clock.after(142.4, httpx.Response(status, json={"error": {"code": code, "message": "busy"}})))
+                with patch.object(proxy, "time", clock), patch.object(proxy, "_sleep_unless_disconnected", clock.sleep), patch.multiple(
+                    proxy, MAX_RATE_LIMIT_WAIT_S=90.0, MAX_TRANSPORT_RECOVERY_WAIT_S=90.0,
+                ):
+                    result = await self.local.post("/v1/responses", json=self.request_body("responses"))
+                self.assertEqual(result.status_code, status)
+                self.assertEqual(len(self.calls), start + 1)
+
+    async def test_transport_and_http_failures_share_the_retry_count(self):
+        self.script.extend([
+            httpx.ReadError("first failure"),
+            httpx.Response(503, json={"error": {"code": "server_error", "message": "busy"}}),
+            httpx.ReadError("last failure"),
+        ])
+        result = await self.local.post("/v1/responses", json=self.request_body("responses"))
+        self.assertEqual(result.status_code, 502)
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(result.json()["error"]["retries"], 2)
+        self.assertIn("last failure", result.json()["error"]["message"])
+
+    async def test_transport_recovery_still_honors_a_shared_rate_limit(self):
+        clock = _Clock()
+
+        def fail(request):
+            clock.now += 142.4
+            proxy._RATE_LIMIT_STATE["cooldown_until"] = clock.now + 100.0
+            return httpx.ReadError("connection failed")
+
+        self.script.append(fail)
+        with patch.object(proxy, "time", clock), patch.object(proxy, "_sleep_unless_disconnected", clock.sleep), patch.multiple(
+            proxy, MAX_RATE_LIMIT_WAIT_S=90.0, MAX_TRANSPORT_RECOVERY_WAIT_S=90.0,
+        ):
+            result = await self.local.post("/v1/responses", json=self.request_body("responses"))
+        self.assertEqual(result.status_code, 429)
+        self.assertGreaterEqual(int(result.headers["retry-after"]), 100)
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_expired_transport_budget_does_not_launch_another_attempt(self):
+        clock = _Clock()
+
+        async def delayed_sleep(delay, request):
+            clock.now += 91.0
+            return True
+
+        self.script.append(httpx.ReadError("network read failed"))
+        with patch.object(proxy, "time", clock), patch.object(proxy, "_sleep_unless_disconnected", delayed_sleep), patch.object(
+            proxy, "MAX_TRANSPORT_RECOVERY_WAIT_S", 90.0,
+        ):
+            result = await self.local.post("/v1/responses", json=self.request_body("responses"))
+        self.assertEqual(result.status_code, 502)
+        self.assertEqual(result.json()["error"]["code"], "upstream_transport_retries_exhausted")
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_content_blocked_preserves_upstream_details_without_retry_or_history_changes(self):
+        request_id = "20261116163640840765114lh28gBMSYDeFO"
+        error = {
+            "code": "content-blocked", "type": "agent_router_api_error", "param": "",
+            "message": f"content-blocked (request id: {request_id})",
+        }
+        for endpoint in ("/v1/responses", "/responses", "/v1/chat/completions", "/chat/completions"):
+            with self.subTest(endpoint=endpoint):
+                start = len(self.calls)
+                payload = self.request_body(endpoint)
+                original = copy.deepcopy(payload)
+                self.script.append(httpx.Response(400, json={"error": error}))
+                result = await self.local.post(endpoint, json=payload)
+                explained = result.json()["error"]
+                self.assertEqual(result.status_code, 400)
+                self.assertEqual(explained["code"], error["code"])
+                self.assertEqual(explained["type"], error["type"])
+                self.assertEqual(explained["param"], error["param"])
+                self.assertEqual(explained["upstream_message"], error["message"])
+                self.assertEqual(explained["request_id"], request_id)
+                self.assertFalse(explained["retryable"])
+                self.assertIn("not retried", explained["message"])
+                self.assertEqual(len(self.calls), start + 1)
+                self.assertEqual(payload, original)
+                self.assertEqual(proxy._RATE_LIMIT_STATE["streak"], 0)
+                self.assertEqual(proxy.STATS["stateless_fallbacks_applied"], 0)
+
+    async def test_initial_json_and_sse_content_rejections_return_400_not_retryable_502(self):
+        error = {"code": "content_filter", "message": "content filter rejected this request"}
+        failed = {"type": "response.failed", "response": {"status": "failed", "error": error}}
+        for endpoint in ("/v1/responses", "/v1/chat/completions"):
+            for stream in (False, True):
+                with self.subTest(endpoint=endpoint, stream=stream):
+                    start = len(self.calls)
+                    upstream = _sse(b"data: " + json.dumps(failed).encode() + b"\n\n") if stream else httpx.Response(200, json=failed)
+                    self.script.append(upstream)
+                    result = await self.local.post(endpoint, json=self.request_body(endpoint, stream=stream))
+                    self.assertEqual(result.status_code, 400)
+                    self.assertEqual(result.json()["error"]["code"], "content_filter")
+                    self.assertFalse(result.json()["error"]["retryable"])
+                    self.assertEqual(len(self.calls), start + 1)
+                    self.assertTrue(upstream.is_closed)
+        self.assertEqual(proxy.STATS["permanent_errors_total"], 4)
+        self.assertEqual(proxy.STATS["successful_recoveries"], 0)
+
+    async def test_policy_rejection_never_activates_resource_mismatch_recovery(self):
+        self.script.append(httpx.Response(400, json={"error": {"code": "content-blocked", "message": MISMATCH}}))
+        result = await self.local.post("/v1/responses", json={**self.request_body("responses"), "previous_response_id": "resp_old"})
+        self.assertEqual(result.status_code, 400)
+        self.assertEqual(result.json()["error"]["code"], "content-blocked")
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(proxy.STATS["stateless_fallbacks_applied"], 0)
+        self.assertEqual(self.calls[0]["previous_response_id"], "resp_old")
+
+    async def test_content_rejection_diagnostics_log_counts_not_content_or_credentials(self):
+        self.script.append(httpx.Response(400, headers={"x-request-id": "request-123"}, json={"error": {
+            "code": "content-blocked", "message": "content-blocked: private-prompt Bearer diagnostic-token",
+        }}))
+        payload = {
+            "model": "test", "instructions": "private-instructions",
+            "input": [{"role": "user", "content": [
+                {"type": "input_text", "text": "private-prompt"},
+                {"type": "input_image", "image_url": "https://example.invalid/private-image"},
+            ]}],
+        }
+        with self.assertLogs(proxy.logger, level="WARNING") as captured:
+            result = await self.local.post("/v1/responses", json=payload)
+        self.assertEqual(result.json()["error"]["request_id"], "request-123")
+        self.assertEqual(result.headers["x-request-id"], "request-123")
+        self.assertNotIn("diagnostic-token", result.text)
+        diagnostic = "\n".join(captured.output)
+        self.assertIn("request_bytes=", diagnostic)
+        self.assertIn("input_items=1 images=1", diagnostic)
+        for secret in ("private-prompt", "private-instructions", "private-image", "diagnostic-token"):
+            self.assertNotIn(secret, diagnostic)
+
+    async def test_content_rejection_after_transport_retry_is_not_a_successful_recovery(self):
+        self.script.extend([httpx.ReadError("network read failed"), httpx.Response(400, json={"error": {
+            "code": "content-blocked", "message": "content-blocked",
+        }})])
+        result = await self.local.post("/v1/responses", json=self.request_body("responses"))
+        self.assertEqual(result.status_code, 400)
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(proxy.STATS["successful_recoveries"], 0)
+
+    async def test_content_rejection_after_partial_output_is_forwarded_without_retry(self):
+        failed = b'event: error\ndata: {"type":"error","error":{"code":"content-blocked","message":"content-blocked"}}\n\n'
+        for endpoint in ("/v1/responses", "/v1/chat/completions"):
+            with self.subTest(endpoint=endpoint):
+                start = len(self.calls)
+                self.script.append(_sse(DELTA, failed))
+                result = await self.local.post(endpoint, json=self.request_body(endpoint, stream=True))
+                self.assertEqual(result.status_code, 200)
+                self.assertIn("partial", result.text)
+                self.assertIn("content-blocked", result.text)
+                self.assertEqual(len(self.calls), start + 1)
+
+    async def test_responses_only_app_uses_same_recovery_and_reports_active_setting(self):
+        clock = _Clock()
+        self.script.extend([
+            clock.after(142.4, httpx.ReadError("network read failed")), _complete(),
+            httpx.Response(400, json={"error": {"code": "content-blocked", "message": "content-blocked"}}),
+        ])
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=proxy.app), base_url="http://local") as client:
+            with patch.object(proxy, "time", clock), patch.object(proxy, "_sleep_unless_disconnected", clock.sleep), patch.multiple(
+                proxy, MAX_RATE_LIMIT_WAIT_S=90.0, MAX_TRANSPORT_RECOVERY_WAIT_S=90.0,
+            ):
+                self.assertEqual((await client.post("/v1/responses", json=self.request_body("responses"))).status_code, 200)
+                rejection = await client.post("/responses", json=self.request_body("responses"))
+                self.assertEqual(rejection.status_code, 400)
+                self.assertFalse(rejection.json()["error"]["retryable"])
+                for health_client in (client, self.local):
+                    health = (await health_client.get("/_health")).json()
+                    self.assertEqual(health["transport_recovery_wait_seconds"], 90.0)
+        self.assertEqual(len(self.calls), 3)
+
     async def test_blank_transport_errors_name_attempts_without_changing_retry_count(self):
         for endpoint in ("/v1/responses", "/v1/chat/completions"):
             with self.subTest(endpoint=endpoint):
@@ -212,7 +457,9 @@ class RecoveryRegressionTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertLogs(proxy.logger, level="WARNING") as captured:
                     result = await self.local.post(endpoint, json=self.request_body(endpoint))
                 self.assertEqual(result.status_code, 502)
-                self.assertEqual(result.json()["error"]["message"], "Proxy upstream communication error: ReadTimeout")
+                self.assertTrue(result.json()["error"]["message"].startswith("Proxy upstream communication error: ReadTimeout."))
+                self.assertEqual(result.json()["error"]["code"], "upstream_transport_retries_exhausted")
+                self.assertIn("same OpenCode session", result.json()["error"]["message"])
                 self.assertEqual(result.json()["error"]["type"], "proxy_error")
                 self.assertEqual(len(self.calls), start + 3)
                 attempts = [record.getMessage() for record in captured.records if record.levelname == "ERROR"]
