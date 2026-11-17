@@ -31,7 +31,7 @@ def _upstream_base(raw: str) -> str:
 UPSTREAM = _upstream_base(os.environ.get("XINGCHI_UPSTREAM", "https://api.xingchiapi.com"))
 logger = logging.getLogger("xingchi-proxy")
 MAX_429_RETRIES = 2
-MAX_429_RECOVERY_S = 90.0
+MAX_429_RECOVERY_S = 8.0
 
 
 def _retry_delay(headers, retry: int) -> float:

@@ -68,9 +68,11 @@ Xingchi requests retain their native bodies, response formats, query parameters,
 Chat Completions requests are not converted to Responses.
 SSE responses stream directly instead of waiting for the complete response.
 The relay does not apply Azure recovery or image pruning to Xingchi requests.
-HTTP `429` responses permit two retries within a 90-second recovery window, starting at the first `429`.
+HTTP `429` responses permit two retries within an 8-second recovery window, starting at the first `429`.
 Retries honor `Retry-After` seconds, HTTP dates, and `retry-after-ms`. Without valid hints, delays use exponential backoff with jitter.
 If a delay exceeds the remaining budget, the relay returns the latest `429` without shortening the delay.
+For example, a 40-second `Retry-After` returns immediately instead of holding the client or retrying too early.
+The window bounds retry waits and new attempt launches, not an in-flight request or model generation.
 Known permanent quota, authentication, and policy rejections do not receive retries.
 Other HTTP errors, transport failures, and streams after output do not receive automatic retries.
 Logs identify retry waits, exhaustion, and usable responses after retries. A recovered HTTP response does not confirm stream completion.

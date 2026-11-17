@@ -246,7 +246,8 @@ class XingchiRelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('[Xingchi Retry Exhausted]', '\n'.join(logs.output))
 
     async def test_long_hint_and_permanent_quota_are_not_retried(self):
-        for headers, payload in (({'retry-after': '120'}, {'error': {'code': 'rate_limit_exceeded'}}), ({}, {'error': {'code': 'insufficient_quota'}})):
+        self.assertLess(xingchi_proxy.MAX_429_RECOVERY_S, 10)
+        for headers, payload in (({'retry-after': '40'}, {'error': {'code': 'rate_limit_exceeded'}}), ({'retry-after': '10'}, {}), ({}, {'error': {'code': 'insufficient_quota'}})):
             start = len(self.calls)
             self.script.append(httpx.Response(429, headers=headers, json=payload))
             with patch.object(xingchi_proxy, '_wait_retry', new_callable=AsyncMock) as wait:
@@ -269,7 +270,7 @@ class XingchiRelayTests(unittest.IsolatedAsyncioTestCase):
         self.script.append(httpx.Response(429, content=b'last rejection'))
         clock = [0.0]
         async def wait(*args):
-            clock[0] = 91.0
+            clock[0] = xingchi_proxy.MAX_429_RECOVERY_S + 1
         with patch.object(xingchi_proxy, '_wait_retry', side_effect=wait), patch.object(xingchi_proxy.time, 'monotonic', side_effect=lambda: clock[0]):
             async with self.client(chat_proxy.app) as client:
                 result = await client.post('/xingchi/responses', json={})
