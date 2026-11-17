@@ -140,11 +140,33 @@ def register_routes(app: FastAPI, backend) -> None:
         recovery_deadline = None
         try:
             while True:
-                response = await backend._send_with_transport_retry(
-                    backend.get_shared_client(), method=request.method, url=UPSTREAM + upstream_path,
-                    headers=headers, content=body, params=request.query_params.multi_items(),
-                    stream=True, max_retries=1, request=request,
-                )
+                # A prior 429 is already closed. Never reuse it as this attempt's
+                # response if sending fails, and never retry the relay iterator.
+                response = None
+                try:
+                    response = await backend._send_with_transport_retry(
+                        backend.get_shared_client(), method=request.method, url=UPSTREAM + upstream_path,
+                        headers=headers, content=body, params=request.query_params.multi_items(),
+                        stream=True, max_retries=1, request=request,
+                    )
+                except backend.RETRYABLE_TRANSPORT_ERRORS as exc:
+                    diagnostic = backend.describe_exception(exc)
+                    if not backend._retryable_transport_error(exc):
+                        logger.warning("[Xingchi Retry Stopped] Transport recovery disabled: %s", diagnostic)
+                        raise
+                    if recovery_deadline is None:
+                        recovery_deadline = time.monotonic() + MAX_429_RECOVERY_S
+                    delay = _retry_delay({}, retries)
+                    if retries >= MAX_429_RETRIES or time.monotonic() + delay >= recovery_deadline:
+                        logger.warning("[Xingchi Retry Exhausted] Transport failure; retries=%d: %s", retries, diagnostic)
+                        raise
+                    retries += 1
+                    logger.warning("[Xingchi Retry %d/%d] Transport failure; waiting %.2fs: %s", retries, MAX_429_RETRIES, delay, diagnostic)
+                    await _wait_retry(backend, request, delay)
+                    if time.monotonic() >= recovery_deadline:
+                        logger.warning("[Xingchi Retry Exhausted] Transport failure; reason=time budget: %s", diagnostic)
+                        raise
+                    continue
                 if response.status_code != 429:
                     break
                 if recovery_deadline is None:
@@ -177,7 +199,7 @@ def register_routes(app: FastAPI, backend) -> None:
                 if response.is_success:
                     logger.info("[Xingchi Recovered] Upstream HTTP %d after %d retries; response completion not yet confirmed", response.status_code, retries)
                 else:
-                    logger.warning("[Xingchi Retry Stopped] HTTP %d after %d retries; not eligible for 429 recovery", response.status_code, retries)
+                    logger.warning("[Xingchi Retry Stopped] HTTP %d after %d retries; not eligible for recovery", response.status_code, retries)
             response_headers = backend._clean_response_headers(response.headers)
             nominated = {name.strip().lower() for name in response.headers.get("connection", "").split(",")}
             response_headers = {name: value for name, value in response_headers.items() if name.lower() not in nominated}

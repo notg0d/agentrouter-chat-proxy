@@ -200,15 +200,83 @@ class XingchiRelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.calls), 6)
         self.assertEqual(proxy._RATE_LIMIT_STATE["cooldown_until"], 0)
 
-    async def test_transport_error_is_redacted_and_not_retried(self):
-        self.script.append(httpx.ConnectError("xingchi-secret"))
-        with patch.dict(os.environ, {"XINGCHI_API_KEY": "xingchi-secret"}):
+    async def test_transport_error_is_redacted_and_retries_are_bounded(self):
+        self.script.extend([httpx.ConnectError("xingchi-secret") for _ in range(3)])
+        with patch.dict(os.environ, {"XINGCHI_API_KEY": "xingchi-secret"}), patch.object(xingchi_proxy, '_wait_retry', new_callable=AsyncMock):
             async with self.client(proxy.app) as client:
                 result = await client.get("/xingchi/models")
         self.assertEqual(result.status_code, 502)
         self.assertIn("ConnectError", result.text)
         self.assertNotIn("xingchi-secret", result.text)
+        self.assertEqual(len(self.calls), 3)
+
+    async def test_winerror_64_recovers_before_headers_on_both_apps(self):
+        for app in (proxy.app, chat_proxy.app):
+            start = len(self.calls)
+            error = httpx.ReadError('')
+            error.__cause__ = ConnectionResetError(64, 'The specified network name is no longer available')
+            self.script.extend([error, httpx.Response(200, json={'ok': True})])
+            with patch.object(xingchi_proxy, '_wait_retry', new_callable=AsyncMock), self.assertLogs(xingchi_proxy.logger, level='INFO') as logs:
+                async with self.client(app) as client:
+                    result = await client.post('/xingchi/responses', content=b'{"input":"unchanged"}')
+            self.assertEqual(result.status_code, 200)
+            self.assertEqual(len(self.calls), start + 2)
+            self.assertEqual(self.calls[-1].content, self.calls[-2].content)
+            self.assertIn('ConnectionResetError', '\n'.join(logs.output))
+            self.assertIn('[Xingchi Recovered]', '\n'.join(logs.output))
+
+    async def test_429_and_transport_failures_share_retry_count(self):
+        self.script.extend([httpx.Response(429, json={}), httpx.ReadError('reset'), httpx.ConnectError('reset')])
+        with patch.object(xingchi_proxy, '_wait_retry', new_callable=AsyncMock) as wait:
+            async with self.client(chat_proxy.app) as client:
+                result = await client.post('/xingchi/responses', json={})
+        self.assertEqual(result.status_code, 502)
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(wait.await_count, 2)
+
+    async def test_conservative_mode_does_not_retry_ambiguous_read_failure(self):
+        self.script.append(httpx.ReadError('reset'))
+        with patch.object(proxy, 'RETRY_AMBIGUOUS_ERRORS', False), patch.object(xingchi_proxy, '_wait_retry', new_callable=AsyncMock) as wait:
+            async with self.client(chat_proxy.app) as client:
+                result = await client.post('/xingchi/responses', json={})
+        self.assertEqual(result.status_code, 502)
         self.assertEqual(len(self.calls), 1)
+        wait.assert_not_awaited()
+
+    async def test_disconnect_during_transport_delay_stops_retry(self):
+        self.script.append(httpx.ReadError('reset'))
+        with patch.object(xingchi_proxy, '_wait_retry', side_effect=proxy._ClientDisconnected):
+            async with self.client(chat_proxy.app) as client:
+                result = await client.post('/xingchi/responses', json={})
+        self.assertEqual(result.status_code, 499)
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_transport_budget_expiry_after_wait_stops_retry(self):
+        self.script.append(httpx.ReadError('reset'))
+        clock = [0.0]
+        async def wait(*args):
+            clock[0] = 9.0
+        with patch.object(xingchi_proxy, '_wait_retry', side_effect=wait), patch.object(xingchi_proxy.time, 'monotonic', side_effect=lambda: clock[0]):
+            async with self.client(chat_proxy.app) as client:
+                result = await client.post('/xingchi/responses', json={})
+        self.assertEqual(result.status_code, 502)
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_read_error_after_partial_output_is_never_replayed(self):
+        class ResetStream(ByteStream):
+            async def __aiter__(self):
+                yield b'data: {"type":"response.output_text.delta","delta":"partial"}\n\n'
+                raise httpx.ReadError('connection reset')
+        stream = ResetStream([])
+        self.script.append(httpx.Response(200, headers={'content-type':'text/event-stream'}, stream=stream))
+        with patch.object(xingchi_proxy, '_wait_retry', new_callable=AsyncMock) as wait:
+            async with self.client(chat_proxy.app) as client:
+                result = await client.post('/xingchi/responses', json={'stream': True})
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(result.content.count(b'partial'), 1)
+        self.assertIn(b'upstream_stream_interrupted', result.content)
+        self.assertTrue(stream.closed)
+        wait.assert_not_awaited()
 
     async def test_429_retries_preserve_payload_close_response_and_log_recovery(self):
         for app in (proxy.app, chat_proxy.app):
