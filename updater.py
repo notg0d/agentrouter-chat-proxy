@@ -25,7 +25,7 @@ from typing import Any, Iterable, Optional
 
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
-_CORE_PYTHON_FILES = ("proxy.py", "chat_proxy.py", "request_guard.py", "service.py", "updater.py")
+_CORE_PYTHON_FILES = ("proxy.py", "chat_proxy.py", "xingchi_proxy.py", "request_guard.py", "service.py", "updater.py")
 
 
 def load_env_file(repo_root: Path) -> None:

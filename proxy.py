@@ -209,6 +209,9 @@ def _load_env():
 
 _load_env()
 
+# Xingchi configuration must see the same .env values as the main proxy.
+import xingchi_proxy
+
 UPSTREAM = os.environ.get("AGENTROUTER_UPSTREAM", "https://agentrouter.org").rstrip("/")
 DEFAULT_LISTEN_HOST = "127.0.0.1"
 
@@ -354,7 +357,7 @@ HOP_BY_HOP = frozenset({
     "host",
     "content-length",
     "accept-encoding",
-    "x-proxy-token",  # Local authentication must never reach AgentRouter.
+    "x-proxy-token",  # Local authentication must never reach an upstream server.
 })
 
 STRIP_RESPONSE_HEADERS = HOP_BY_HOP | {"content-encoding", "date"}
@@ -786,6 +789,7 @@ def redact_sensitive(text: str) -> str:
     for secret in (
         PROXY_AUTH_TOKEN, os.environ.get("CODEX_GATEWAY_API_KEY"),
         os.environ.get("AGENTROUTER_API_KEY"), os.environ.get("CODEX_AGENTROUTER_GATEWAY_KEY"),
+        os.environ.get("XINGCHI_API_KEY"),
     ):
         if secret:
             text = text.replace(secret, "[redacted]")
@@ -1048,26 +1052,30 @@ app.add_middleware(
     upload_timeout_s=lambda: BODY_UPLOAD_TIMEOUT_S, stats=STATS,
 )
 
-def _filter_headers(headers: Dict[str, str]) -> Dict[str, str]:
+def _filter_headers(
+    headers: Dict[str, str], *, fallback_keys: Tuple[str, ...] = ("CODEX_GATEWAY_API_KEY", "AGENTROUTER_API_KEY"),
+    agentrouter_compat: bool = True,
+) -> Dict[str, str]:
     """Filters client headers for proxy forwarding and injects fallback auth if needed."""
     out = {}
     has_auth = False
+    auth_headers = {"authorization"} if agentrouter_compat else {"authorization", "x-api-key", "x-goog-api-key"}
     nominated = {name.strip().lower() for k, v in headers.items() if k.lower() == "connection" for name in v.split(",")}
     for k, v in headers.items():
         k_lower = k.lower()
-        if k_lower == "authorization":
+        if k_lower in auth_headers:
             has_auth = True
         if k_lower not in HOP_BY_HOP and k_lower not in nominated:
             out[k] = v
 
     if not has_auth:
-        fallback_key = os.environ.get("CODEX_GATEWAY_API_KEY") or os.environ.get("AGENTROUTER_API_KEY")
+        fallback_key = next((os.environ[name] for name in fallback_keys if os.environ.get(name)), None)
         if fallback_key:
             out["authorization"] = f"Bearer {fallback_key}"
 
     # Ensure a compatible User-Agent for AgentRouter if missing or generic
     ua = out.get("user-agent") or out.get("User-Agent")
-    if not ua or "python" in ua.lower() or "curl" in ua.lower():
+    if agentrouter_compat and (not ua or "python" in ua.lower() or "curl" in ua.lower()):
         out["user-agent"] = "Codex Desktop"
 
     return out
@@ -1088,6 +1096,7 @@ async def health():
         "listen": f"{LISTEN_HOST}:{PORT}",
         "uptime_seconds": uptime_s,
         "upstream": UPSTREAM,
+        "additional_upstreams": {"xingchi": xingchi_proxy.UPSTREAM},
         "stats": STATS,
     }
 
@@ -2060,6 +2069,9 @@ async def recover_responses_request(
             if await _client_disconnected(request):
                 return Response(status_code=499)
             return last_failure_response
+
+xingchi_proxy.register_routes(app, sys.modules[__name__])
+
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def passthrough_handler(request: Request, path: str):

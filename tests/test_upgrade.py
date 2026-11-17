@@ -511,7 +511,7 @@ class ConfigurationAndServiceTests(unittest.TestCase):
             self.assertNotIn(secret, text)
 
     def test_updater_compiles_all_runtime_modules(self):
-        self.assertTrue({"proxy.py", "chat_proxy.py", "request_guard.py", "service.py", "updater.py"}.issubset(updater._CORE_PYTHON_FILES))
+        self.assertTrue({"proxy.py", "chat_proxy.py", "xingchi_proxy.py", "request_guard.py", "service.py", "updater.py"}.issubset(updater._CORE_PYTHON_FILES))
 
 
 if __name__ == "__main__":

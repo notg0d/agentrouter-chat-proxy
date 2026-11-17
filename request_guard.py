@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import re
 import time
 from typing import Callable
 
@@ -22,7 +23,58 @@ POST_PATHS = frozenset({
 })
 
 
+XINGCHI_PREFIX = "/xingchi"
+XINGCHI_POST_PATHS = frozenset({
+    "/v1/responses", "/v1/responses/compact", "/v1/responses/input_tokens",
+    "/v1/chat/completions", "/v1/messages", "/v1/messages/count_tokens",
+    "/v1/embeddings", "/v1/images/generations", "/v1/images/edits",
+    "/v1/images/generations/async", "/v1/images/edits/async",
+    "/backend-api/codex/responses", "/backend-api/codex/responses/compact",
+    "/backend-api/codex/responses/input_tokens",
+    "/antigravity/v1/messages", "/antigravity/v1/messages/count_tokens",
+})
+XINGCHI_GET_PATHS = frozenset({
+    "/v1/models", "/v1/usage", "/v1/sub2api/billing", "/backend-api/codex/models",
+    "/antigravity/models", "/antigravity/v1/models", "/antigravity/v1/usage",
+    "/v1beta/models", "/antigravity/v1beta/models",
+})
+_XINGCHI_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_XINGCHI_GEMINI_ACTIONS = frozenset({"generateContent", "streamGenerateContent", "countTokens", "embedContent", "batchEmbedContents"})
+
+
+def xingchi_upstream_path(path: str) -> str:
+    """Map only the fixed Xingchi namespace; unversioned aliases use /v1."""
+    if not path.startswith(XINGCHI_PREFIX + "/"):
+        return ""
+    upstream_path = path[len(XINGCHI_PREFIX):]
+    if not upstream_path.startswith(("/v1/", "/v1beta/", "/antigravity/", "/backend-api/codex/")):
+        upstream_path = "/v1" + upstream_path
+    return upstream_path
+
+
+def _xingchi_allowed_methods(path: str) -> frozenset[str]:
+    upstream_path = xingchi_upstream_path(path)
+    if upstream_path in XINGCHI_GET_PATHS:
+        return frozenset({"GET"})
+    if upstream_path in XINGCHI_POST_PATHS:
+        return frozenset({"POST"})
+    for prefix in ("/v1/models/", "/v1beta/models/", "/antigravity/v1beta/models/", "/v1/images/tasks/"):
+        if not upstream_path.startswith(prefix):
+            continue
+        model, separator, action = upstream_path[len(prefix):].partition(":")
+        if not _XINGCHI_MODEL_RE.fullmatch(model):
+            return frozenset()
+        if separator:
+            if "v1beta" in prefix and action in _XINGCHI_GEMINI_ACTIONS:
+                return frozenset({"POST"})
+            return frozenset()
+        return frozenset({"GET"})
+    return frozenset()
+
+
 def allowed_methods(path: str) -> frozenset[str]:
+    if path.startswith(XINGCHI_PREFIX + "/"):
+        return _xingchi_allowed_methods(path)
     if path in ("/_health", "/_stats", "/v1/models", "/models"):
         return frozenset({"GET"})
     for prefix in ("/v1/models/", "/models/"):

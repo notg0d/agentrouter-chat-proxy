@@ -1,8 +1,9 @@
 # AgentRouter OpenCode Proxy
 
 This local proxy connects **OpenCode** to **AgentRouter**.
+It also provides separate native routes for **XingchiAPI**.
 It also supports **Codex**.
-It converts Chat Completions requests to Responses requests.
+It converts AgentRouter Chat Completions requests to Responses requests.
 It uses supplied conversation history for Azure session recovery.
 It can send requests again after temporary upstream errors.
 Both client APIs use one recovery pipeline.
@@ -30,9 +31,80 @@ Unknown routes return HTTP `404`. Incorrect methods return HTTP `405`.
 The proxy uses HTTP and server-sent events (SSE).
 It does not use Responses WebSockets.
 
+### XingchiAPI routes
+
+Both programs provide separate Xingchi routes under `/xingchi`.
+The default Xingchi server is `https://api.xingchiapi.com`.
+Existing AgentRouter routes do not change.
+
+| Client route | Upstream route | Method |
+| --- | --- | --- |
+| `/xingchi/v1/responses` | `/v1/responses` | `POST` |
+| `/xingchi/v1/responses/compact` | `/v1/responses/compact` | `POST` |
+| `/xingchi/v1/responses/input_tokens` | `/v1/responses/input_tokens` | `POST` |
+| `/xingchi/v1/chat/completions` | `/v1/chat/completions` | `POST` |
+| `/xingchi/v1/messages` | `/v1/messages` | `POST` |
+| `/xingchi/v1/messages/count_tokens` | `/v1/messages/count_tokens` | `POST` |
+| `/xingchi/v1/models`, `/xingchi/v1/models/{model}` | Same route without `/xingchi` | `GET` |
+| `/xingchi/v1/usage`, `/xingchi/v1/sub2api/billing` | Same route without `/xingchi` | `GET` |
+| `/xingchi/v1/embeddings` | `/v1/embeddings` | `POST` |
+| `/xingchi/v1/images/generations`, `/xingchi/v1/images/edits` | Same route without `/xingchi` | `POST` |
+| `/xingchi/v1/images/generations/async`, `/xingchi/v1/images/edits/async` | Same route without `/xingchi` | `POST` |
+| `/xingchi/v1/images/tasks/{task_id}` | Same route without `/xingchi` | `GET` |
+| `/xingchi/v1beta/models`, `/xingchi/v1beta/models/{model}` | Same route without `/xingchi` | `GET` |
+| `/xingchi/v1beta/models/{model}:{action}` | Same route without `/xingchi` | `POST` |
+
+The Gemini actions are `generateContent`, `streamGenerateContent`, `countTokens`, `embedContent`, and `batchEmbedContents`.
+Use `?alt=sse` when the Gemini client requires it.
+Unversioned aliases, such as `/xingchi/responses` and `/xingchi/models`, map to `/v1`.
+
+The relay also permits these Sub2API compatibility routes under `/xingchi`:
+
+- `/backend-api/codex/models`, `/backend-api/codex/responses`, and the Responses `compact` and `input_tokens` subpaths.
+- `/antigravity/models`, `/antigravity/v1/models`, `/antigravity/v1/usage`, `/antigravity/v1/messages`, and `/antigravity/v1/messages/count_tokens`.
+- `/antigravity/v1beta/models` and the same Gemini model routes and actions.
+
+Xingchi requests retain their native bodies, response formats, query parameters, and session headers.
+Chat Completions requests are not converted to Responses.
+SSE responses stream directly instead of waiting for the complete response.
+The relay does not apply Azure recovery, image pruning, or automatic retries to Xingchi requests.
+It preserves upstream errors and does not send partial output again.
+Local authentication, upload limits, and SSE frame limits still apply.
+Xingchi errors do not start AgentRouter's shared retry delay.
+
+Use a Xingchi API key in `Authorization: Bearer ...`, `x-api-key`, or `x-goog-api-key`.
+Without these headers, the relay uses `XINGCHI_API_KEY` if configured.
+It never uses AgentRouter fallback keys for Xingchi routes.
+A client-supplied key is forwarded as supplied; use the correct key for each provider.
+The local `X-Proxy-Token` remains separate and is not forwarded.
+
+For an OpenCode Responses provider, use these settings:
+
+```json
+{
+  "baseURL": "http://127.0.0.1:8789/xingchi/v1",
+  "apiKey": "{env:XINGCHI_API_KEY}",
+  "transport": "http"
+}
+```
+
+Set the provider's `env` value to `["XINGCHI_API_KEY"]`.
+Use the Responses package from the OpenCode example below.
+For native Chat Completions, use the Chat Completions package with the same URL.
+For Anthropic clients, use `http://127.0.0.1:8789/xingchi` as the base URL.
+For Gemini clients, use `http://127.0.0.1:8789/xingchi/v1beta` as the API base.
+Responses-only mode provides the same Xingchi routes on port `8788`.
+Select a model available to the Xingchi API key's group.
+
+Xingchi's [public site](https://api.xingchiapi.com/home) advertises Claude, GPT, Gemini, and Antigravity support.
+It links to [Sub2API](https://github.com/Wei-Shaw/sub2api), whose [gateway routes](https://github.com/Wei-Shaw/sub2api/blob/main/backend/internal/server/routes/gateway.go) define the compatibility paths.
+These routes do not guarantee that every feature is enabled for a Xingchi account.
+The model, usage, billing, Gemini, and Antigravity discovery endpoints require an API key.
+Model access, quotas, and image permissions depend on the service configuration and the key's group.
+
 ### Chat Completions conversion
 
-The proxy converts supplied messages to a Responses request without server-state references.
+For AgentRouter routes, the proxy converts supplied messages to a Responses request without server-state references.
 It then converts Responses output to Chat Completions output.
 
 - The input conversion includes text, images, function calls, and function outputs.
@@ -339,6 +411,8 @@ Other users can read keys in repository files.
 | Variable | Default value | Function |
 | --- | --- | --- |
 | `AGENTROUTER_UPSTREAM` | `https://agentrouter.org` | Upstream server URL |
+| `XINGCHI_UPSTREAM` | `https://api.xingchiapi.com` | Separate Xingchi server URL; optional trailing `/v1` |
+| `XINGCHI_API_KEY` | Empty | Fallback key for Xingchi routes only |
 | `CHAT_PROXY_PORT` | `8789` | Port for `chat_proxy.py` |
 | `PROXY_PORT` | `8788` | Port for `proxy.py` |
 | `PROXY_AUTH_TOKEN` | Empty | Separate local token; required for non-loopback startup |
@@ -446,6 +520,7 @@ The health data on port `8789` include these fields:
 | `stats.responses_requests` | Number of native Responses requests |
 | `stats.chat_requests` | Number of translated Chat Completions requests |
 | `responses_stats` | Shared recovery and request-guard counters |
+| `additional_upstreams.xingchi` | Server URL for the separate Xingchi routes |
 
 `requests_rejected_total` counts request-guard and converted-body size rejections.
 `permanent_errors_total` counts permanent upstream errors found by the recovery pipeline before output.

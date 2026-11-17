@@ -43,6 +43,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import proxy
+import xingchi_proxy
 
 logger = logging.getLogger("agentrouter-chat-proxy")
 
@@ -745,6 +746,7 @@ async def health():
         "listen": f"{LISTEN_HOST}:{PORT}",
         "uptime_seconds": round(time.time() - STATS["start_time"], 1),
         "upstream": UPSTREAM,
+        "additional_upstreams": {"xingchi": xingchi_proxy.UPSTREAM},
         "stats": STATS,
         "responses_stats": proxy.STATS,
     }
@@ -812,6 +814,9 @@ async def handle_chat_completions(request: Request):
         code, message, _ = proxy._extract_error_fields(parsed, "")
         return _chat_error(502, message or "Upstream request failed", code=code)
     return JSONResponse(content=responses_json_to_chat(parsed, model), status_code=200, headers=resp_headers)
+
+
+xingchi_proxy.register_routes(app, proxy)
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
