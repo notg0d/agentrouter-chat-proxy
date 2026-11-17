@@ -67,7 +67,13 @@ The relay also permits these Sub2API compatibility routes under `/xingchi`:
 Xingchi requests retain their native bodies, response formats, query parameters, and session headers.
 Chat Completions requests are not converted to Responses.
 SSE responses stream directly instead of waiting for the complete response.
-The relay does not apply Azure recovery, image pruning, or automatic retries to Xingchi requests.
+The relay does not apply Azure recovery or image pruning to Xingchi requests.
+HTTP `429` responses permit two retries within a 90-second recovery window, starting at the first `429`.
+Retries honor `Retry-After` seconds, HTTP dates, and `retry-after-ms`. Without valid hints, delays use exponential backoff with jitter.
+If a delay exceeds the remaining budget, the relay returns the latest `429` without shortening the delay.
+Known permanent quota, authentication, and policy rejections do not receive retries.
+Other HTTP errors, transport failures, and streams after output do not receive automatic retries.
+Logs identify retry waits, exhaustion, and usable responses after retries. A recovered HTTP response does not confirm stream completion.
 It preserves upstream errors and does not send partial output again.
 Local authentication, upload limits, and SSE frame limits still apply.
 Xingchi errors do not start AgentRouter's shared retry delay.

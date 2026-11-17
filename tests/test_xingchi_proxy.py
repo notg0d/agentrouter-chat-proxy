@@ -7,7 +7,9 @@ import json
 import os
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 
 import httpx
 
@@ -207,6 +209,112 @@ class XingchiRelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ConnectError", result.text)
         self.assertNotIn("xingchi-secret", result.text)
         self.assertEqual(len(self.calls), 1)
+
+    async def test_429_retries_preserve_payload_close_response_and_log_recovery(self):
+        for app in (proxy.app, chat_proxy.app):
+            with self.subTest(app=app):
+                start = len(self.calls)
+                stream = ByteStream([b'{"error":{"code":"rate_limit_exceeded"}}'])
+                self.script.extend([httpx.Response(429, stream=stream, headers={"retry-after": "7"}), httpx.Response(200, json={"ok": True})])
+                async def wait(backend, request, delay):
+                    self.assertTrue(stream.closed)
+                    self.assertGreaterEqual(delay, 7)
+                body = b'{"model":"test","input":"unchanged"}'
+                with patch.object(xingchi_proxy, "_wait_retry", side_effect=wait), self.assertLogs(xingchi_proxy.logger, level="INFO") as logs:
+                    async with self.client(app) as client:
+                        result = await client.post("/xingchi/responses?tag=a&tag=b", content=body, headers={"authorization": "Bearer test-only"})
+                self.assertEqual(result.status_code, 200)
+                self.assertEqual(len(self.calls), start + 2)
+                self.assertEqual(self.calls[-1].content, body)
+                self.assertEqual(self.calls[-1].headers['authorization'], 'Bearer test-only')
+                self.assertEqual(self.calls[-1].url.params.get_list('tag'), ['a', 'b'])
+                self.assertIn('[Xingchi Retry 1/2]', '\n'.join(logs.output))
+                self.assertIn('[Xingchi Recovered]', '\n'.join(logs.output))
+                self.assertEqual(proxy._RATE_LIMIT_STATE['cooldown_until'], 0)
+
+    async def test_429_exhaustion_returns_last_body_headers_and_exact_attempt_count(self):
+        self.script.extend([httpx.Response(429, content=f'limited-{i}'.encode(), headers={'retry-after': '1', 'x-request-id': str(i)}) for i in range(3)])
+        with patch.object(xingchi_proxy, '_wait_retry', new_callable=AsyncMock) as wait, self.assertLogs(xingchi_proxy.logger, level='WARNING') as logs:
+            async with self.client(chat_proxy.app) as client:
+                result = await client.post('/xingchi/responses', json={})
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(wait.await_count, 2)
+        self.assertEqual(result.status_code, 429)
+        self.assertEqual(result.content, b'limited-2')
+        self.assertEqual(result.headers['retry-after'], '1')
+        self.assertEqual(result.headers['x-request-id'], '2')
+        self.assertIn('[Xingchi Retry Exhausted]', '\n'.join(logs.output))
+
+    async def test_long_hint_and_permanent_quota_are_not_retried(self):
+        for headers, payload in (({'retry-after': '120'}, {'error': {'code': 'rate_limit_exceeded'}}), ({}, {'error': {'code': 'insufficient_quota'}})):
+            start = len(self.calls)
+            self.script.append(httpx.Response(429, headers=headers, json=payload))
+            with patch.object(xingchi_proxy, '_wait_retry', new_callable=AsyncMock) as wait:
+                async with self.client(chat_proxy.app) as client:
+                    result = await client.post('/xingchi/responses', json={})
+            self.assertEqual(result.status_code, 429)
+            self.assertEqual(result.json(), payload)
+            self.assertEqual(len(self.calls), start + 1)
+            wait.assert_not_awaited()
+
+    async def test_disconnect_during_429_delay_does_not_launch_retry(self):
+        self.script.append(httpx.Response(429, json={}))
+        with patch.object(xingchi_proxy, '_wait_retry', side_effect=proxy._ClientDisconnected):
+            async with self.client(chat_proxy.app) as client:
+                result = await client.post('/xingchi/responses', json={})
+        self.assertEqual(result.status_code, 499)
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_budget_expiry_during_wait_does_not_launch_retry(self):
+        self.script.append(httpx.Response(429, content=b'last rejection'))
+        clock = [0.0]
+        async def wait(*args):
+            clock[0] = 91.0
+        with patch.object(xingchi_proxy, '_wait_retry', side_effect=wait), patch.object(xingchi_proxy.time, 'monotonic', side_effect=lambda: clock[0]):
+            async with self.client(chat_proxy.app) as client:
+                result = await client.post('/xingchi/responses', json={})
+        self.assertEqual(result.status_code, 429)
+        self.assertEqual(result.content, b'last rejection')
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_retry_wait_observes_disconnect_without_agentrouter_cooldown(self):
+        class Request:
+            async def is_disconnected(self):
+                return True
+        with self.assertRaises(proxy._ClientDisconnected):
+            await xingchi_proxy._wait_retry(proxy, Request(), 60)
+        self.assertEqual(proxy._RATE_LIMIT_STATE['cooldown_until'], 0)
+
+    async def test_retried_stream_is_not_replayed_after_partial_output(self):
+        partial = b'data: {"type":"response.output_text.delta","delta":"partial"}\n\n'
+        self.script.extend([httpx.Response(429, json={}), httpx.Response(200, headers={'content-type':'text/event-stream'}, stream=ByteStream([partial]))])
+        with patch.object(xingchi_proxy, '_wait_retry', new_callable=AsyncMock):
+            async with self.client(chat_proxy.app) as client:
+                result = await client.post('/xingchi/responses', json={'stream': True})
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(result.content.count(b'partial'), 1)
+        self.assertIn(b'upstream_stream_interrupted', result.content)
+
+    async def test_502_after_429_is_not_retried_or_logged_as_recovery(self):
+        self.script.extend([httpx.Response(429, json={}), httpx.Response(502, content=b'upstream failed')])
+        with patch.object(xingchi_proxy, '_wait_retry', new_callable=AsyncMock), self.assertLogs(xingchi_proxy.logger, level='INFO') as logs:
+            async with self.client(chat_proxy.app) as client:
+                result = await client.post('/xingchi/responses', json={})
+        self.assertEqual(result.status_code, 502)
+        self.assertEqual(len(self.calls), 2)
+        self.assertIn('[Xingchi Retry Stopped]', '\n'.join(logs.output))
+        self.assertNotIn('[Xingchi Recovered]', '\n'.join(logs.output))
+
+    def test_retry_delay_hints_dates_invalid_values_and_backoff(self):
+        with patch.object(xingchi_proxy.random, 'uniform', return_value=0):
+            self.assertEqual(xingchi_proxy._retry_delay(httpx.Headers({'retry-after-ms':'500'}), 0), 0.5)
+            self.assertEqual(xingchi_proxy._retry_delay(httpx.Headers({'retry-after':'7'}), 0), 7)
+            for raw in ('NaN', 'inf', '-1', 'invalid'):
+                self.assertEqual(xingchi_proxy._retry_delay(httpx.Headers({'retry-after':raw}), 1), 2)
+            date = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=30), usegmt=True)
+            delay = xingchi_proxy._retry_delay(httpx.Headers({'retry-after':date}), 0)
+            self.assertGreater(delay, 28)
+            self.assertLessEqual(delay, 30)
 
     async def test_native_sse_formats_are_preserved(self):
         streams = (

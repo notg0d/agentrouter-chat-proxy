@@ -5,7 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
+import random
+import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit
 
 import httpx
@@ -25,6 +30,38 @@ def _upstream_base(raw: str) -> str:
 
 UPSTREAM = _upstream_base(os.environ.get("XINGCHI_UPSTREAM", "https://api.xingchiapi.com"))
 logger = logging.getLogger("xingchi-proxy")
+MAX_429_RETRIES = 2
+MAX_429_RECOVERY_S = 90.0
+
+
+def _retry_delay(headers, retry: int) -> float:
+    """Honor valid upstream hints without shortening them to fit our budget."""
+    for name, scale in (("retry-after-ms", 0.001), ("retry-after", 1.0)):
+        raw = headers.get(name)
+        if raw is None:
+            continue
+        try:
+            delay = float(raw) * scale
+        except ValueError:
+            if name != "retry-after":
+                continue
+            try:
+                date = parsedate_to_datetime(raw)
+                if date.tzinfo is None:
+                    date = date.replace(tzinfo=timezone.utc)
+                delay = max(0.0, (date - datetime.now(timezone.utc)).total_seconds())
+            except (ValueError, TypeError, OverflowError):
+                continue
+        if math.isfinite(delay) and delay >= 0:
+            return delay + random.uniform(0.1, 0.4)
+    return min(2.0 ** retry, 8.0) + random.uniform(0.1, 0.4)
+
+
+async def _wait_retry(backend, request: Request, delay: float) -> None:
+    """Do not touch AgentRouter's cooldown or its rate-limit wait counters."""
+    async def wait():
+        await asyncio.sleep(delay)
+    await backend._run_unless_disconnected(wait, request)
 
 
 def _stream_error(path: str, code: str, message: str) -> bytes:
@@ -99,12 +136,48 @@ def register_routes(app: FastAPI, backend) -> None:
         )
         body = await request.body()
         response = None
+        retries = 0
+        recovery_deadline = None
         try:
-            response = await backend._send_with_transport_retry(
-                backend.get_shared_client(), method=request.method, url=UPSTREAM + upstream_path,
-                headers=headers, content=body, params=request.query_params.multi_items(),
-                stream=True, max_retries=1, request=request,
-            )
+            while True:
+                response = await backend._send_with_transport_retry(
+                    backend.get_shared_client(), method=request.method, url=UPSTREAM + upstream_path,
+                    headers=headers, content=body, params=request.query_params.multi_items(),
+                    stream=True, max_retries=1, request=request,
+                )
+                if response.status_code != 429:
+                    break
+                if recovery_deadline is None:
+                    recovery_deadline = time.monotonic() + MAX_429_RECOVERY_S
+                content = await backend._read_and_close_response(response, request)
+                try:
+                    payload = json.loads(content)
+                except (ValueError, UnicodeDecodeError):
+                    payload = None
+                code, message, _ = backend._extract_error_fields(payload if isinstance(payload, dict) else None, "")
+                # Quota, authentication, and policy rejections can also use 429.
+                permanent = (
+                    backend.classify_upstream_error(429, code, message) == "permanent"
+                    or code.lower() in {"api_key_required", "invalid_api_key", "unauthenticated", "permission_denied"}
+                )
+                delay = _retry_delay(response.headers, retries)
+                remaining = recovery_deadline - time.monotonic()
+                if permanent or retries >= MAX_429_RETRIES or delay >= remaining:
+                    reason = "permanent rejection" if permanent else "retry limit" if retries >= MAX_429_RETRIES else "time budget"
+                    logger.warning("[Xingchi Retry Exhausted] HTTP 429; retries=%d; reason=%s", retries, reason)
+                    break
+                retries += 1
+                logger.warning("[Xingchi Retry %d/%d] HTTP 429; waiting %.2fs", retries, MAX_429_RETRIES, delay)
+                await _wait_retry(backend, request, delay)
+                if time.monotonic() >= recovery_deadline:
+                    logger.warning("[Xingchi Retry Exhausted] HTTP 429; retries=%d; reason=time budget", retries - 1)
+                    break
+
+            if retries and response.status_code != 429:
+                if response.is_success:
+                    logger.info("[Xingchi Recovered] Upstream HTTP %d after %d retries; response completion not yet confirmed", response.status_code, retries)
+                else:
+                    logger.warning("[Xingchi Retry Stopped] HTTP %d after %d retries; not eligible for 429 recovery", response.status_code, retries)
             response_headers = backend._clean_response_headers(response.headers)
             nominated = {name.strip().lower() for name in response.headers.get("connection", "").split(",")}
             response_headers = {name: value for name, value in response_headers.items() if name.lower() not in nominated}
