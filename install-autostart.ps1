@@ -1,6 +1,6 @@
 <#
     install-autostart.ps1 -- register a Windows scheduled task that starts the
-    AgentRouter OpenCode Proxy at logon.
+    dev-api-proxy at logon.
 
     Semantics: LOGON autostart, not boot autostart. The task uses an
     Interactive principal and an at-logon trigger, so the proxy starts a few
@@ -68,7 +68,7 @@ $arguments = '"{0}" --mode {1} --port {2} --max-log-kb {3}' -f $script, $Mode, $
 if ($NoAutoUpdate) { $arguments += ' --no-auto-update' }
 
 Write-Host ''
-Write-Host '  AgentRouter OpenCode Proxy: scheduled task to be registered' -ForegroundColor White
+Write-Host '  dev-api-proxy: scheduled task to be registered' -ForegroundColor White
 Write-Host "  name      : $TaskName"        -ForegroundColor DarkGray
 Write-Host "  account   : $account"          -ForegroundColor DarkGray
 Write-Host "  trigger   : at logon, +${DelaySeconds}s delay" -ForegroundColor DarkGray
@@ -123,7 +123,7 @@ if ($verify) {
         $health = Invoke-RestMethod "http://127.0.0.1:$Port/_health" -TimeoutSec 5 -ErrorAction Stop
         $required = if ($Mode -eq 'combined') { @('responses', 'chat.completions') } else { @('responses') }
         $missing = @($required | Where-Object { $_ -notin $health.supported_apis })
-        if ($health.proxy -in @('agentrouter-codex-proxy', 'agentrouter-chat-proxy') -and
+        if ($health.proxy -in @('dev-api-proxy', 'agentrouter-codex-proxy', 'agentrouter-chat-proxy', 'agentrouter-llm-proxy', 'agentrouter-proxy') -and
             $health.status -eq 'ok' -and $health.listen -eq "127.0.0.1:$Port" -and $missing.Count -eq 0) {
             Write-Host "[ ok  ] OpenCode proxy is active and responding on http://127.0.0.1:$Port/_health" -ForegroundColor Green
         } else {

@@ -169,7 +169,7 @@ def _probe_our_health(
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
             if not isinstance(data, dict):
                 return False
-            identity_ok = data.get("proxy") in ("agentrouter-codex-proxy", "agentrouter-chat-proxy")
+            identity_ok = data.get("proxy") in ("dev-api-proxy", "agentrouter-codex-proxy", "agentrouter-chat-proxy", "agentrouter-llm-proxy", "agentrouter-proxy")
             required = {"responses", "chat.completions"} if mode == "combined" else {"responses"}
             apis = data.get("supported_apis")
             apis_ok = mode is None or (isinstance(apis, list) and all(api in apis for api in required))
@@ -285,7 +285,7 @@ def _remove_pid_file(pid_path: Path) -> None:
 
 
 def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Headless background supervisor for the AgentRouter OpenCode Proxy.")
+    parser = argparse.ArgumentParser(description="Headless background supervisor for dev-api-proxy for OpenCode.")
     parser.add_argument("--mode", choices=("responses", "combined"), default="responses")
     parser.add_argument(
         "--host",
@@ -425,7 +425,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         while not stop_event.is_set() and not restart_for_update.is_set():
             started_at = time.monotonic()
             cmd = _worker_command(worker_python, args)
-            logger.write("start", f"starting AgentRouter OpenCode Proxy ({args.mode}) via headless uvicorn on {args.host}:{args.port}")
+            logger.write("start", f"starting dev-api-proxy ({args.mode}) via headless uvicorn on {args.host}:{args.port}")
             proc = subprocess.Popen(cmd, **_subprocess_kwargs(pipe_output=True))
             with child_lock:
                 active_child["proc"] = proc

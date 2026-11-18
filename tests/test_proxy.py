@@ -1,4 +1,4 @@
-"""Automated unit and async integration tests for the AgentRouter OpenCode Proxy."""
+"""Automated unit and async integration tests for dev-api-proxy."""
 
 from __future__ import annotations
 

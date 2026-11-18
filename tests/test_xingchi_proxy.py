@@ -535,10 +535,10 @@ class XingchiRelayTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(task, return_exceptions=True)
 
     async def test_health_exposes_additional_upstream_without_changing_identity(self):
-        for module, identity in ((proxy, "agentrouter-codex-proxy"), (chat_proxy, "agentrouter-chat-proxy")):
+        for module, identity in ((proxy, "dev-api-proxy"), (chat_proxy, "dev-api-proxy")):
             data = await module.health()
             self.assertEqual(data["proxy"], identity)
-            self.assertEqual(data["additional_upstreams"], {"xingchi": "https://api.xingchiapi.com"})
+            self.assertEqual(data["additional_upstreams"]["xingchi"], "https://api.xingchiapi.com")
 
 
 if __name__ == "__main__":

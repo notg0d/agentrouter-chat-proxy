@@ -58,7 +58,7 @@ logging.basicConfig(
     format="[%(asctime)s] %(levelname)s: %(message)s",
     datefmt="%H:%M:%S",
 )
-logger = logging.getLogger("agentrouter-codex-proxy")
+logger = logging.getLogger("dev-api-proxy.responses")
 
 # ----------------------------------------------------------------------------
 # Resilient DNS Resolver (Fixes [Errno 11001] getaddrinfo failed permanently)
@@ -211,6 +211,7 @@ _load_env()
 
 # Xingchi configuration must see the same .env values as the main proxy.
 import xingchi_proxy
+import freegg_proxy
 
 UPSTREAM = os.environ.get("AGENTROUTER_UPSTREAM", "https://agentrouter.org").rstrip("/")
 DEFAULT_LISTEN_HOST = "127.0.0.1"
@@ -258,7 +259,7 @@ def _parse_proxy_cli_args(
     """Parse standalone CLI arguments for running `python proxy.py`."""
     resolved_default_port = default_port if default_port is not None else PORT
     parser = argparse.ArgumentParser(
-        description="Local OpenAI API compatibility proxy for OpenCode and AgentRouter."
+        description="dev-api-proxy: local OpenAI API compatibility proxy for OpenCode."
     )
     parser.add_argument(
         "--host",
@@ -790,6 +791,7 @@ def redact_sensitive(text: str) -> str:
         PROXY_AUTH_TOKEN, os.environ.get("CODEX_GATEWAY_API_KEY"),
         os.environ.get("AGENTROUTER_API_KEY"), os.environ.get("CODEX_AGENTROUTER_GATEWAY_KEY"),
         os.environ.get("XINGCHI_API_KEY"),
+        os.environ.get("FREEGG_API_KEY"),
     ):
         if secret:
             text = text.replace(secret, "[redacted]")
@@ -1042,8 +1044,8 @@ async def _app_lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="AgentRouter OpenCode Proxy",
-    description="Local Responses compatibility proxy with cross-resource recovery for OpenCode and AgentRouter",
+    title="dev-api-proxy",
+    description="Local Responses compatibility proxy for OpenCode with AgentRouter recovery and native Xingchi and FreeGG routes",
     version="1.7.0",
     lifespan=_app_lifespan,
 )
@@ -1085,7 +1087,7 @@ async def health():
     uptime_s = round(time.time() - STATS["start_time"], 1)
     return {
         "status": "ok",
-        "proxy": "agentrouter-codex-proxy",
+        "proxy": "dev-api-proxy",
         "version": "1.7.0",
         "supported_apis": ["responses"],
         "proxy_auth_enabled": bool(PROXY_AUTH_TOKEN),
@@ -1096,7 +1098,7 @@ async def health():
         "listen": f"{LISTEN_HOST}:{PORT}",
         "uptime_seconds": uptime_s,
         "upstream": UPSTREAM,
-        "additional_upstreams": {"xingchi": xingchi_proxy.UPSTREAM},
+        "additional_upstreams": {"xingchi": xingchi_proxy.UPSTREAM, "freegg": freegg_proxy.UPSTREAM},
         "stats": STATS,
     }
 
@@ -2071,6 +2073,7 @@ async def recover_responses_request(
             return last_failure_response
 
 xingchi_proxy.register_routes(app, sys.modules[__name__])
+freegg_proxy.register_routes(app, sys.modules[__name__])
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
@@ -2129,6 +2132,6 @@ if __name__ == "__main__":
 
     bind_scope = "loopback only" if is_loopback_host(LISTEN_HOST) else "non-loopback -- firewall required"
     url_host = f"[{LISTEN_HOST}]" if ":" in LISTEN_HOST and not LISTEN_HOST.startswith("[") else LISTEN_HOST
-    print(f"[*] Starting AgentRouter OpenCode Proxy (responses) on http://{url_host}:{PORT} ({bind_scope})")
+    print(f"[*] Starting dev-api-proxy (responses) on http://{url_host}:{PORT} ({bind_scope})")
     print(f"[*] Forwarding to upstream: {UPSTREAM}")
     uvicorn.run(app, host=LISTEN_HOST, port=PORT, timeout_keep_alive=600, log_level="info")

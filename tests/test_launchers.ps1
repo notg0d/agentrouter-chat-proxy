@@ -64,7 +64,7 @@ foreach ($file in @('start-proxy.ps1', 'install-autostart.ps1')) {
         $node.GetCommandName() -in @('Write-Line', 'Write-Host', 'Write-Warn')
     }, $true))
     $text = $messages.Extent.Text -join "`n"
-    if (-not $text.Contains('AgentRouter OpenCode Proxy')) { throw "$file is missing the OpenCode display name" }
+    if (-not $text.Contains('dev-api-proxy')) { throw "$file is missing the project display name" }
     if ($text -match '\bCodex\b') { throw "$file still has a Codex display message" }
     if ($file -eq 'start-proxy.ps1' -and
         -not $text.Contains('Configure OpenCode to send its AgentRouter API key in the Authorization header.')) {
@@ -88,7 +88,7 @@ function Invoke-RestMethod {
 }
 $Mode = 'combined'
 $script:HealthFixture = [pscustomobject]@{
-    status = 'ok'; proxy = 'agentrouter-chat-proxy'; listen = '127.0.0.1:8789'
+    status = 'ok'; proxy = 'dev-api-proxy'; listen = '127.0.0.1:8789'
     supported_apis = @('responses')
 }
 Assert-Equal (Test-OurProxy -OnPort 8789) $false 'Combined mode rejects a Responses-only listener'
@@ -96,7 +96,7 @@ $script:HealthFixture.supported_apis = @('responses', 'chat.completions')
 Assert-Equal (Test-OurProxy -OnPort 8789) $true 'Combined capabilities accepted'
 $script:HealthFixture.proxy = 'unrelated-service'
 Assert-Equal (Test-OurProxy -OnPort 8789) $false 'Unrelated service rejected'
-$script:HealthFixture.proxy = 'agentrouter-chat-proxy'
+$script:HealthFixture.proxy = 'dev-api-proxy'
 $script:HealthFixture.listen = '0.0.0.0:8789'
 Assert-Equal (Test-OurProxy -OnPort 8789) $false 'Different bind address rejected'
 Write-Output 'Launcher health capability checks OK'

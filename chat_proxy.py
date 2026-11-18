@@ -44,15 +44,16 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import proxy
 import xingchi_proxy
+import freegg_proxy
 
-logger = logging.getLogger("agentrouter-chat-proxy")
+logger = logging.getLogger("dev-api-proxy.combined")
 
 UPSTREAM = proxy.UPSTREAM
 DEFAULT_LISTEN_HOST = proxy.DEFAULT_LISTEN_HOST
 PORT = int(os.environ.get("CHAT_PROXY_PORT", "8789"))
 LISTEN_HOST, PORT = proxy._extract_uvicorn_bind_overrides(sys.argv, DEFAULT_LISTEN_HOST, PORT)
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 STATS: Dict[str, Any] = {
     "requests_total": 0,
@@ -720,8 +721,8 @@ async def _app_lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="AgentRouter OpenCode Proxy",
-    description="Local Chat Completions and Responses compatibility proxy for OpenCode and AgentRouter",
+    title="dev-api-proxy",
+    description="Local Chat Completions and Responses compatibility proxy for OpenCode with AgentRouter, Xingchi, and FreeGG routes",
     version=VERSION,
     lifespan=_app_lifespan,
 )
@@ -736,7 +737,7 @@ app.add_middleware(
 async def health():
     return {
         "status": "ok",
-        "proxy": "agentrouter-chat-proxy",
+        "proxy": "dev-api-proxy",
         "version": VERSION,
         "api": "chat.completions",
         "supported_apis": ["chat.completions", "responses"],
@@ -746,7 +747,7 @@ async def health():
         "listen": f"{LISTEN_HOST}:{PORT}",
         "uptime_seconds": round(time.time() - STATS["start_time"], 1),
         "upstream": UPSTREAM,
-        "additional_upstreams": {"xingchi": xingchi_proxy.UPSTREAM},
+        "additional_upstreams": {"xingchi": xingchi_proxy.UPSTREAM, "freegg": freegg_proxy.UPSTREAM},
         "stats": STATS,
         "responses_stats": proxy.STATS,
     }
@@ -817,6 +818,7 @@ async def handle_chat_completions(request: Request):
 
 
 xingchi_proxy.register_routes(app, proxy)
+freegg_proxy.register_routes(app, proxy)
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
@@ -869,6 +871,6 @@ if __name__ == "__main__":
 
     bind_scope = "loopback only" if proxy.is_loopback_host(LISTEN_HOST) else "non-loopback -- firewall required"
     url_host = f"[{LISTEN_HOST}]" if ":" in LISTEN_HOST and not LISTEN_HOST.startswith("[") else LISTEN_HOST
-    print(f"[*] Starting AgentRouter OpenCode Proxy (combined) on http://{url_host}:{PORT} ({bind_scope})")
+    print(f"[*] Starting dev-api-proxy (combined) on http://{url_host}:{PORT} ({bind_scope})")
     print(f"[*] Serving /v1/chat/completions and /v1/responses -> {UPSTREAM}/v1/responses")
     uvicorn.run(app, host=LISTEN_HOST, port=PORT, timeout_keep_alive=600, log_level="info")

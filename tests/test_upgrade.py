@@ -421,7 +421,7 @@ class OpenCodePresentationTests(unittest.IsolatedAsyncioTestCase):
     def test_api_docs_use_opencode_name(self):
         for module in (proxy, chat_proxy):
             with self.subTest(module=module.__name__):
-                self.assertEqual(module.app.title, "AgentRouter OpenCode Proxy")
+                self.assertEqual(module.app.title, "dev-api-proxy")
                 self.assertIn("OpenCode", module.app.description)
                 self.assertNotIn("Codex", module.app.description)
 
@@ -438,8 +438,8 @@ class OpenCodePresentationTests(unittest.IsolatedAsyncioTestCase):
             check.assert_not_called()
             apply.assert_not_called()
 
-    async def test_legacy_health_identities_remain_compatible(self):
-        for module, identity in ((proxy, "agentrouter-codex-proxy"), (chat_proxy, "agentrouter-chat-proxy")):
+    async def test_health_uses_project_name(self):
+        for module, identity in ((proxy, "dev-api-proxy"), (chat_proxy, "dev-api-proxy")):
             with self.subTest(module=module.__name__):
                 self.assertEqual((await module.health())["proxy"], identity)
 
@@ -462,7 +462,7 @@ class ConfigurationAndServiceTests(unittest.TestCase):
             self.assertEqual(service._parse_args(["--mode", "combined", "--port", "9333"]).port, 9333)
 
     def test_health_probe_checks_identity_address_and_api_capabilities(self):
-        good = {"status": "ok", "proxy": "agentrouter-chat-proxy", "listen": "127.0.0.1:8789",
+        good = {"status": "ok", "proxy": "dev-api-proxy", "listen": "127.0.0.1:8789",
                 "supported_apis": ["responses", "chat.completions"]}
         for payload, expected in ((good, True), ({**good, "supported_apis": ["responses"]}, False),
                                   ({**good, "proxy": "other"}, False), ({**good, "listen": "0.0.0.0:8789"}, False),

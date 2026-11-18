@@ -15,7 +15,7 @@ The proxy can recover from some temporary upstream failures. It cannot guarantee
 - Shared cooldowns remain in effect. HTTP errors cannot start a fresh transport recovery window.
 - These windows limit retry delays and new attempt launches. They do not cancel an in-flight attempt at expiry.
 - Known authentication, billing, quota, invalid-input, and content-policy errors do not receive automatic retries.
-- Read and write failures can occur after AgentRouter accepts work. Automatic retries can produce duplicate work or additional charges.
+- Read and write failures can occur after an upstream accepts work. Automatic retries can produce duplicate work or additional charges.
 - `PROXY_RETRY_AMBIGUOUS_ERRORS=0` disables retries for ambiguous transport errors, empty streams, and initial SSE timeouts.
 - `PROXY_RETRY_ON_5XX=0` disables retries for upstream server errors.
 - Initial Server-Sent Events (SSE) use a bounded inspection buffer before the proxy sends response headers downstream.
@@ -27,7 +27,7 @@ These options do not provide an exactly-once guarantee. TCP keep-alive and downs
 
 When transport recovery stops, HTTP `502` includes `upstream_transport_retries_exhausted` and the failure cause.
 With automatic transport retries disabled, the code is `upstream_transport_error`.
-Both errors explain that a retry can use the same OpenCode session.
+Both errors explain that a retry can use the same client session.
 The proxy does not read or change local session data.
 
 Content-policy rejections remain non-retryable.
@@ -46,7 +46,7 @@ The proxy cannot identify which content caused a generic rejection.
 The proxy watches downstream disconnects during connection setup, header waits, buffered body reads, and retry delays.
 A downstream disconnect cancels pending upstream work. It does not count as a transport failure that needs another attempt.
 The application returns status `499` internally. A disconnected client usually cannot receive that response.
-Cancellation does not prove that AgentRouter stopped generation or cancelled billing.
+Cancellation does not prove that the upstream stopped generation or cancelled billing.
 
 Each streaming HTTP response owns its upstream response and producer task.
 Cleanup closes the iterator, cancels and joins the producer, and closes the upstream response.

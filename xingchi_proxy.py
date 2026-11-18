@@ -98,7 +98,7 @@ def _terminal_frame(backend, frame: bytes) -> tuple[bool, bool]:
     return False, False
 
 
-async def _relay_stream(backend, response: httpx.Response, path: str):
+async def _relay_stream(backend, response: httpx.Response, path: str, label: str = "Xingchi"):
     """Forward bounded native frames without replaying output or inventing success."""
     frames = backend._SSEFrameBuffer()
     terminal_seen = False
@@ -116,23 +116,31 @@ async def _relay_stream(backend, response: httpx.Response, path: str):
             terminal_seen = terminal_seen or terminal
             yield frame + b"\n\n"
         if not terminal_seen:
-            yield _stream_error(path, "upstream_stream_interrupted", "Xingchi stream ended without a terminal event. Partial output was not replayed.")
+            yield _stream_error(path, "upstream_stream_interrupted", f"{label} stream ended without a terminal event. Partial output was not replayed.")
     except backend.SSEFrameTooLarge:
-        yield _stream_error(path, "upstream_sse_frame_too_large", "Xingchi SSE frame exceeds PROXY_MAX_SSE_FRAME_BYTES.")
+        yield _stream_error(path, "upstream_sse_frame_too_large", f"{label} SSE frame exceeds PROXY_MAX_SSE_FRAME_BYTES.")
     except Exception as exc:
-        logger.warning("[Xingchi Stream Interrupted] %s", backend.describe_exception(exc))
-        yield _stream_error(path, "upstream_stream_interrupted", "Xingchi stream was interrupted. Partial output was not replayed.")
+        logger.warning("[%s Stream Interrupted] %s", label, backend.describe_exception(exc))
+        yield _stream_error(path, "upstream_stream_interrupted", f"{label} stream was interrupted. Partial output was not replayed.")
     finally:
         await backend._close_upstream_response(response)
 
 
-def register_routes(app: FastAPI, backend) -> None:
+class _ProviderLogger(logging.LoggerAdapter):
+    def process(self, message, kwargs):
+        return message.replace("Xingchi", self.extra["label"]), kwargs
+
+
+def register_routes(app: FastAPI, backend, *, provider: str = "xingchi", upstream=None,
+                    prefix: str = XINGCHI_PREFIX, path_mapper=xingchi_upstream_path) -> None:
     """Install the same native relay on both proxy applications."""
+    label = "FreeGG" if provider == "freegg" else "Xingchi"
+    logger = _ProviderLogger(logging.getLogger("xingchi-proxy"), {"label": label})
     async def handle_xingchi(request: Request, path: str):
         backend.STATS["requests_total"] += 1
-        upstream_path = xingchi_upstream_path(request.url.path)
+        upstream_path = path_mapper(request.url.path)
         headers = backend._filter_headers(
-            dict(request.headers), fallback_keys=("XINGCHI_API_KEY",), agentrouter_compat=False,
+            dict(request.headers), fallback_keys=(provider.upper() + "_API_KEY",), agentrouter_compat=False,
         )
         body = await request.body()
         response = None
@@ -145,7 +153,7 @@ def register_routes(app: FastAPI, backend) -> None:
                 response = None
                 try:
                     response = await backend._send_with_transport_retry(
-                        backend.get_shared_client(), method=request.method, url=UPSTREAM + upstream_path,
+                        backend.get_shared_client(), method=request.method, url=(upstream() if upstream else UPSTREAM) + upstream_path,
                         headers=headers, content=body, params=request.query_params.multi_items(),
                         stream=True, max_retries=1, request=request,
                     )
@@ -205,7 +213,7 @@ def register_routes(app: FastAPI, backend) -> None:
             response_headers = {name: value for name, value in response_headers.items() if name.lower() not in nominated}
             if response.is_success and "text/event-stream" in response.headers.get("content-type", "").lower():
                 return backend._UpstreamStreamingResponse(
-                    _relay_stream(backend, response, upstream_path), upstream_response=response, producer_task=None,
+                    _relay_stream(backend, response, upstream_path, label), upstream_response=response, producer_task=None,
                     status_code=response.status_code, headers=response_headers,
                 )
             content = await backend._read_and_close_response(response, request)
@@ -223,12 +231,12 @@ def register_routes(app: FastAPI, backend) -> None:
             if response is not None:
                 await backend._close_upstream_response(response)
             diagnostic = backend.describe_exception(exc)
-            logger.error("[Xingchi Error] %s %s: %s", request.method, upstream_path, diagnostic)
+            logger.error("[%s Error] %s %s: %s", provider, request.method, upstream_path, diagnostic)
             return JSONResponse(status_code=502, content={"error": {
-                "type": "proxy_error", "code": "xingchi_upstream_error",
-                "message": f"Xingchi upstream error: {diagnostic}",
+                "type": "proxy_error", "code": f"{provider}_upstream_error",
+                "message": f"{provider} upstream error: {diagnostic}",
             }})
 
     # Applications call this before registering their generic catch-all route.
-    app.add_api_route(XINGCHI_PREFIX + "/{path:path}", handle_xingchi,
-                      methods=["GET", "POST"], name="xingchi_relay")
+    app.add_api_route(prefix + "/{path:path}", handle_xingchi,
+                      methods=["GET", "POST"], name=f"{provider}_relay")

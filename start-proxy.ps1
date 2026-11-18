@@ -1,5 +1,5 @@
 <#
-    start-proxy.ps1 -- launch the AgentRouter OpenCode Proxy.
+    start-proxy.ps1 -- launch dev-api-proxy.
 
     Every path is derived from this script's own location, so the repository
     can be cloned anywhere by any user.
@@ -119,7 +119,7 @@ function Test-OurProxy {
         $probe = Invoke-RestMethod "http://${urlHost}:${OnPort}/_health" -TimeoutSec 5 -ErrorAction Stop
         $required = if ($Mode -eq 'combined') { @('responses', 'chat.completions') } else { @('responses') }
         $missing = @($required | Where-Object { $_ -notin $probe.supported_apis })
-        return ($probe.proxy -in @('agentrouter-codex-proxy', 'agentrouter-chat-proxy') -and
+        return ($probe.proxy -in @('dev-api-proxy', 'agentrouter-codex-proxy', 'agentrouter-chat-proxy', 'agentrouter-llm-proxy', 'agentrouter-proxy') -and
                 $probe.status -eq 'ok' -and $probe.listen -eq "${OnHost}:${OnPort}" -and $missing.Count -eq 0)
     } catch { return $false }
 }
@@ -302,7 +302,7 @@ if (-not $isLoopback) {
 }
 
 Write-Line ''
-Write-Line "  AgentRouter OpenCode Proxy ($Mode)" 'White'
+Write-Line "  dev-api-proxy ($Mode)" 'White'
 Write-Line "  upstream : $upstream"  'DarkGray'
 Write-Line "  listen   : http://${BindHost}:${Port} $bindNote" 'DarkGray'
 Write-Line "  stats    : http://${displayProbeUrl}:${Port}/_stats" 'DarkGray'

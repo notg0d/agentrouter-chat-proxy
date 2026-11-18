@@ -313,7 +313,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     repo_root = Path(__file__).resolve().parent
     load_env_file(repo_root)
 
-    parser = argparse.ArgumentParser(description="Safe auto-updater for the AgentRouter OpenCode Proxy.")
+    parser = argparse.ArgumentParser(description="Safe auto-updater for dev-api-proxy for OpenCode.")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="Check for available upstream updates without changing files.")
     mode.add_argument("--apply", action="store_true", help="Fetch and fast-forward apply any clean update (default).")

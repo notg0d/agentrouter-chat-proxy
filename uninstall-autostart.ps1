@@ -52,7 +52,7 @@ try {
     $h = Invoke-RestMethod "http://127.0.0.1:$Port/_health" -TimeoutSec 5 -ErrorAction Stop
     $required = if ($Mode -eq 'combined') { @('responses', 'chat.completions') } else { @('responses') }
     $missing = @($required | Where-Object { $_ -notin $h.supported_apis })
-    if ($h.proxy -in @('agentrouter-codex-proxy', 'agentrouter-chat-proxy') -and
+    if ($h.proxy -in @('dev-api-proxy', 'agentrouter-codex-proxy', 'agentrouter-chat-proxy', 'agentrouter-llm-proxy', 'agentrouter-proxy') -and
         $h.status -eq 'ok' -and $h.listen -eq "127.0.0.1:$Port" -and $missing.Count -eq 0) { $isOurs = $true }
 } catch { }
 

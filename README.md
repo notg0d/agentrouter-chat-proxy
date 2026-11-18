@@ -1,26 +1,25 @@
-# AgentRouter OpenCode Proxy
+# dev-api-proxy
 
-This local proxy connects **OpenCode** to **AgentRouter**.
-It also provides separate native routes for **XingchiAPI**.
-It also supports **Codex**.
-It converts AgentRouter Chat Completions requests to Responses requests.
-It uses supplied conversation history for Azure session recovery.
-It can send requests again after temporary upstream errors.
-Both client APIs use one recovery pipeline.
+`dev-api-proxy` is a local API gateway for coding agents and other AI clients.
+Use it with OpenCode, Codex, or another client that supports compatible API endpoints.
+It connects to a configurable OpenAI-compatible upstream and provides separate native routes for XingchiAPI and FreeGG.
+The default upstream is AgentRouter, but the proxy does not require AgentRouter.
+The primary routes support Responses and Chat Completions clients.
+The proxy can translate Chat Completions for the primary upstream and recover Responses sessions from supplied history.
 
 ## API routes
 
-OpenCode is the primary client. Codex is also supported.
-AgentRouter is the upstream server.
+Clients connect to the local proxy. Configure the upstream that matches your API key and model access.
+AgentRouter is the default primary upstream. You can replace it with another compatible server.
 
 | Program | Default port | Client endpoints |
 | --- | --- | --- |
 | `chat_proxy.py` | `8789` | `/v1/responses`, `/responses`, `/v1/chat/completions`, `/chat/completions` |
 | `proxy.py` | `8788` | `/v1/responses`, `/responses` |
 
-Both programs send native Responses requests to `/v1/responses` on the upstream server.
-The combined program also sends translated Chat Completions requests to that endpoint.
-The default upstream URL is `https://agentrouter.org`.
+Both programs send native Responses requests to `/v1/responses` on the configured primary upstream.
+The combined program also translates Chat Completions requests to Responses for that upstream.
+Set `AGENTROUTER_UPSTREAM` to your primary upstream URL. Its default is `https://agentrouter.org`.
 The proxy forwards only permitted API routes and methods.
 Other permitted routes use buffered forwarding without session recovery or API conversion.
 This includes `/v1/models`, `/v1/embeddings`, `/v1/messages`, and the image and audio routes.
@@ -89,7 +88,7 @@ It never uses AgentRouter fallback keys for Xingchi routes.
 A client-supplied key is forwarded as supplied; use the correct key for each provider.
 The local `X-Proxy-Token` remains separate and is not forwarded.
 
-For an OpenCode Responses provider, use these settings:
+For a Responses-compatible client, use these settings:
 
 ```json
 {
@@ -100,7 +99,7 @@ For an OpenCode Responses provider, use these settings:
 ```
 
 Set the provider's `env` value to `["XINGCHI_API_KEY"]`.
-Use the Responses package from the OpenCode example below.
+Use your client's Responses-compatible API package.
 For native Chat Completions, use the Chat Completions package with the same URL.
 For Anthropic clients, use `http://127.0.0.1:8789/xingchi` as the base URL.
 For Gemini clients, use `http://127.0.0.1:8789/xingchi/v1beta` as the API base.
@@ -113,9 +112,67 @@ These routes do not guarantee that every feature is enabled for a Xingchi accoun
 The model, usage, billing, Gemini, and Antigravity discovery endpoints require an API key.
 Model access, quotas, and image permissions depend on the service configuration and the key's group.
 
+### FreeGG routes
+
+Both programs provide native FreeGG routes under `/freegg`.
+The default upstream server is `https://freegg.app`.
+Existing AgentRouter and Xingchi routes do not change.
+
+| Client route | Method |
+| --- | --- |
+| `/freegg/v1/models`, `/freegg/v1/models/{model}` | `GET` |
+| `/freegg/v1/chat/completions`, `/freegg/v1/completions` | `POST` |
+| `/freegg/v1/responses`, `/freegg/v1/responses/compact` | `POST` |
+| `/freegg/v1/messages` | `POST` |
+| `/freegg/v1/embeddings`, `/freegg/v1/moderations`, `/freegg/v1/rerank` | `POST` |
+| `/freegg/v1/images/generations`, `/freegg/v1/images/edits`, `/freegg/v1/edits` | `POST` |
+| `/freegg/v1/audio/transcriptions`, `/freegg/v1/audio/translations`, `/freegg/v1/audio/speech` | `POST` |
+| `/freegg/v1beta/models`, `/freegg/v1beta/openai/models` | `GET` |
+| `/freegg/v1beta/models/{model}:{action}`, `/freegg/v1/models/{model}:{action}` | `POST` |
+
+The relay removes `/freegg` before forwarding.
+Unversioned aliases, such as `/freegg/models`, map to `/v1`.
+Gemini actions are `generateContent`, `streamGenerateContent`, `embedContent`, and `batchEmbedContents`.
+Token-count, administration, account, file, and WebSocket routes are not exposed.
+
+Supply a FreeGG key in `Authorization: Bearer ...`, `x-api-key`, or `x-goog-api-key`.
+Without these headers, the relay uses `FREEGG_API_KEY` if configured.
+It never uses AgentRouter or Xingchi fallback keys for FreeGG requests.
+Use header authentication instead of a Gemini `key` query parameter.
+The separate local `X-Proxy-Token` is not forwarded.
+
+The relay preserves native request bodies, query parameters, responses, and SSE formats.
+It does not convert Chat Completions to Responses or apply AgentRouter history recovery and image pruning.
+FreeGG uses the same bounded retry policy as the native Xingchi relay.
+HTTP `429` and eligible transport failures share two retries within an eight-second recovery window.
+Long upstream retry hints, permanent quota errors, and streams after output do not receive retries.
+Ambiguous transport retries can cause duplicate work or charges; `PROXY_RETRY_AMBIGUOUS_ERRORS=0` disables them.
+Local authentication, upload limits, disconnect cancellation, and SSE frame limits still apply.
+
+For an OpenAI-compatible client, use:
+
+```text
+Base URL: http://127.0.0.1:8789/freegg/v1
+API key: your FreeGG API key
+```
+
+Use port `8788` for `proxy.py`.
+For Anthropic clients, use `http://127.0.0.1:8789/freegg` as the base URL.
+For Gemini clients, use `http://127.0.0.1:8789/freegg/v1beta`.
+Select a model returned by `/freegg/v1/models` with your FreeGG key.
+
+#### FreeGG API research
+
+FreeGG's [public status endpoint](https://freegg.app/api/status) identifies the service as FreeGG and reports New API `v1.0.0-rc.49`.
+It advertises `https://freegg.app` as its server address and links to [New API documentation](https://docs.newapi.pro).
+The [matching gateway source](https://github.com/QuantumNous/new-api/blob/v1.0.0-rc.49/router/relay-router.go) defines its native compatibility routes.
+The public `/v1/models` endpoint returns HTTP `401` without a valid key.
+Authenticated generation, available models, prices, and account quotas have not been verified.
+Gateway route support does not guarantee that a FreeGG account can use every endpoint or model.
+
 ### Chat Completions conversion
 
-For AgentRouter routes, the proxy converts supplied messages to a Responses request without server-state references.
+For primary upstream routes, the proxy converts supplied messages to a Responses request without server-state references.
 It then converts Responses output to Chat Completions output.
 
 - The input conversion includes text, images, function calls, and function outputs.
@@ -134,13 +191,13 @@ These instructions use PowerShell.
 1. Get the source files.
 
    ```powershell
-   git clone https://github.com/notg0d/agentrouter-chat-proxy.git
+   git clone https://github.com/notg0d/dev-api-proxy.git
    ```
 
 2. Go to the repository directory.
 
    ```powershell
-   cd agentrouter-chat-proxy
+   cd dev-api-proxy
    ```
 
 3. Make a Python virtual environment.
@@ -185,29 +242,29 @@ Do not make this proxy available as a public service.
 
 ## API key
 
-Set `CODEX_GATEWAY_API_KEY` in the client environment.
-The examples keep this legacy key name for compatibility with existing configurations.
+Set an API key that the configured primary upstream accepts.
+`CODEX_GATEWAY_API_KEY` is a legacy variable name that remains supported for existing configurations.
 
 ```powershell
-$env:CODEX_GATEWAY_API_KEY = "your-agentrouter-api-key"
+$env:CODEX_GATEWAY_API_KEY = "your-upstream-api-key"
 ```
 
-The proxy sends the client `Authorization` header to the upstream server.
+The proxy sends the client's `Authorization` header to the configured primary upstream.
 Without that header, the proxy uses a fallback key from its environment or `.env`.
-It tries `CODEX_GATEWAY_API_KEY` before `AGENTROUTER_API_KEY`.
+It tries `CODEX_GATEWAY_API_KEY` before `AGENTROUTER_API_KEY` for compatibility.
 The proxy loads `.env` values only for missing environment variables.
 
 ### Local authentication
 
 Set `PROXY_AUTH_TOKEN` to require a separate token for access to the local proxy.
-Use a long, random value. Do not use your AgentRouter API key as the local token.
+Use a long, random value. Do not use an upstream API key as the local token.
 Authentication is optional on loopback and required for non-loopback startup.
 
 Configure the client to send these headers:
 
 ```text
 X-Proxy-Token: your-local-proxy-token
-Authorization: Bearer your-agentrouter-api-key
+Authorization: Bearer your-upstream-api-key
 ```
 
 The proxy removes `X-Proxy-Token` before upstream forwarding.
@@ -219,12 +276,16 @@ Missing, incorrect, or duplicate local tokens return HTTP `401`.
 Its diagnostics include counters, but never include API keys or the local token.
 `/_stats` and all permitted upstream routes require the token when authentication is enabled.
 
-## Client configuration
+## Local agent configuration
 
-The examples use `gpt-6.1-sol`.
-Select a model available to your AgentRouter account.
+Configure any local agent or AI client that supports an OpenAI-compatible Responses or Chat Completions API.
+Use the matching local endpoint and an API key accepted by that route's upstream.
+The model must be available to the selected provider or account.
 
-### OpenCode V2
+### OpenCode
+
+OpenCode is one example. Use the Responses package for Responses clients or the Chat Completions package for Chat Completions clients.
+Set the provider ID and model name to values that fit your OpenCode configuration.
 
 1. Add this provider to `opencode.json`.
 
@@ -232,11 +293,11 @@ Select a model available to your AgentRouter account.
    {
      "$schema": "https://opencode.ai/config.json",
      "providers": {
-       "agentrouter": {
+        "local-proxy": {
          "package": "@opencode/ai/providers/openai-compatible/responses",
          "env": ["CODEX_GATEWAY_API_KEY"],
          "settings": {
-           "baseURL": "http://127.0.0.1:8789/v1",
+            "baseURL": "http://127.0.0.1:8789/v1",
            "apiKey": "{env:CODEX_GATEWAY_API_KEY}",
            "transport": "http"
          },
@@ -248,24 +309,28 @@ Select a model available to your AgentRouter account.
    }
    ```
 
-2. Select `agentrouter/gpt-6.1-sol` in OpenCode.
+2. Select `local-proxy/<model-id>` in OpenCode. Replace `<model-id>` with a model available from your configured upstream.
 
 For Chat Completions, replace the package value with `@opencode/ai/providers/openai-compatible`.
 Keep the same `baseURL`.
 
-If your client uses this proxy, keep the same provider ID and model ID.
-A different provider is not necessary for session recovery.
+Other local agents can use the same base URL if they support the selected API format.
+The proxy's recovery uses the request history; it does not depend on a client-specific provider ID.
 
-### Codex
+For other OpenAI-compatible agents, use the local base URL and set the API key to the key for the configured primary upstream.
+Use `http://127.0.0.1:8789/xingchi/v1` or `http://127.0.0.1:8789/freegg/v1` to select those providers.
+Set each agent's API format to Responses or Chat Completions as supported by that route.
+
+### Codex example
 
 Use this configuration in `~/.codex/config.toml`:
 
 ```toml
 model = "gpt-6.1-sol"
-model_provider = "agentrouter"
+model_provider = "local-proxy"
 
-[model_providers.agentrouter]
-name = "AgentRouter"
+[model_providers.local-proxy]
+name = "Local proxy"
 base_url = "http://127.0.0.1:8788/v1"
 wire_api = "responses"
 env_key = "CODEX_GATEWAY_API_KEY"
@@ -330,7 +395,7 @@ This window limits retry delays and new attempt launches, not the duration of an
 When transport recovery stops, the proxy returns HTTP `502` with `upstream_transport_retries_exhausted`.
 With automatic retries disabled, it returns `upstream_transport_error`.
 The error includes the failure cause and same-session retry guidance.
-These errors do not require a new OpenCode session.
+These errors do not require a new agent session.
 
 Known authentication, exhausted-quota, billing, invalid-input, and policy errors are not retried.
 `no available channel` is also treated as a permanent error.
@@ -357,7 +422,7 @@ If `rate_limit_exceeded` errors continue:
 1. Decrease the number of concurrent requests.
 2. Use a shorter conversation history or a client-side summary.
 3. Decrease the output token limit or reasoning effort.
-4. Write to AgentRouter for more token capacity.
+4. Contact your upstream provider about token capacity.
 
 The API conversion does not remove token rate limits.
 
@@ -371,7 +436,7 @@ Before client response headers, the error includes:
 
 - The upstream error code, type, and message.
 - The request ID, when available in the upstream error or headers.
-- `retryable: false` and guidance to review the request or contact AgentRouter.
+- `retryable: false` and guidance to review the request or contact the upstream provider.
 
 The proxy preserves non-`200` upstream HTTP statuses.
 An initial HTTP `200` JSON or SSE content rejection becomes HTTP `400`.
@@ -421,9 +486,11 @@ Other users can read keys in repository files.
 
 | Variable | Default value | Function |
 | --- | --- | --- |
-| `AGENTROUTER_UPSTREAM` | `https://agentrouter.org` | Upstream server URL |
+| `AGENTROUTER_UPSTREAM` | `https://agentrouter.org` | Configured primary upstream URL; the variable name remains for compatibility |
 | `XINGCHI_UPSTREAM` | `https://api.xingchiapi.com` | Separate Xingchi server URL; optional trailing `/v1` |
 | `XINGCHI_API_KEY` | Empty | Fallback key for Xingchi routes only |
+| `FREEGG_UPSTREAM` | `https://freegg.app` | Separate FreeGG server URL; optional trailing `/v1` |
+| `FREEGG_API_KEY` | Empty | Fallback key for FreeGG routes only |
 | `CHAT_PROXY_PORT` | `8789` | Port for `chat_proxy.py` |
 | `PROXY_PORT` | `8788` | Port for `proxy.py` |
 | `PROXY_AUTH_TOKEN` | Empty | Separate local token; required for non-loopback startup |
@@ -494,6 +561,7 @@ The service writes logs to `logs/proxy.log` with automatic log rotation.
 The console shows foreground logs.
 Combined mode uses the task name `AgentRouterCombinedProxy`.
 The default Responses-only task keeps the legacy name `AgentRouterCodexProxy` for compatibility.
+These task names are retained for existing installations. They do not limit which agent or upstream you can use.
 An existing scheduled task is not converted automatically.
 The supervisor preserves its mode across restarts and verifies the listener's API capabilities.
 The two modes do not share retry state across processes.
@@ -523,7 +591,7 @@ The health data on port `8789` include these fields:
 
 | Field | Meaning |
 | --- | --- |
-| `version` | Combined program version: `1.2.0` |
+| `version` | Combined program version: `1.3.0` |
 | `supported_apis` | `chat.completions` and `responses` |
 | `proxy_auth_enabled` | Whether local token authentication is enabled |
 | `max_body_bytes` | Configured request body limit |
@@ -532,6 +600,7 @@ The health data on port `8789` include these fields:
 | `stats.chat_requests` | Number of translated Chat Completions requests |
 | `responses_stats` | Shared recovery and request-guard counters |
 | `additional_upstreams.xingchi` | Server URL for the separate Xingchi routes |
+| `additional_upstreams.freegg` | Server URL for the separate FreeGG routes |
 
 `requests_rejected_total` counts request-guard and converted-body size rejections.
 `permanent_errors_total` counts permanent upstream errors found by the recovery pipeline before output.
@@ -541,7 +610,7 @@ For SSE, this counter does not confirm terminal completion.
 Version `1.0.0` of `chat_proxy.py` did not use session recovery for native Responses requests.
 After you update the code, stop the proxy process.
 Start the updated program again.
-Make sure that combined mode shows version `1.2.0` and both APIs in `supported_apis`.
+Make sure that combined mode shows version `1.3.0` and both APIs in `supported_apis`.
 Responses-only mode shows version `1.7.0`.
 
 ## Tests

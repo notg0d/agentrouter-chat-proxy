@@ -24,6 +24,40 @@ POST_PATHS = frozenset({
 
 
 XINGCHI_PREFIX = "/xingchi"
+FREEGG_PREFIX = "/freegg"
+FREEGG_POST_PATHS = frozenset({
+    "/v1/responses", "/v1/responses/compact", "/v1/chat/completions", "/v1/completions",
+    "/v1/messages", "/v1/embeddings", "/v1/moderations", "/v1/rerank",
+    "/v1/images/generations", "/v1/images/edits", "/v1/edits",
+    "/v1/audio/transcriptions", "/v1/audio/translations", "/v1/audio/speech",
+})
+
+
+def freegg_upstream_path(path: str) -> str:
+    """Map the isolated FreeGG namespace to native New API routes."""
+    if not path.startswith(FREEGG_PREFIX + "/"):
+        return ""
+    path = path[len(FREEGG_PREFIX):]
+    return path if path.startswith(("/v1/", "/v1beta/")) else "/v1" + path
+
+
+def _freegg_allowed_methods(path: str) -> frozenset[str]:
+    path = freegg_upstream_path(path)
+    if path in ("/v1/models", "/v1beta/models", "/v1beta/openai/models"):
+        return frozenset({"GET"})
+    if path in FREEGG_POST_PATHS:
+        return frozenset({"POST"})
+    if path.startswith("/v1/models/") and _XINGCHI_MODEL_RE.fullmatch(path[len("/v1/models/"):]):
+        return frozenset({"GET"})
+    if path.startswith(("/v1beta/models/", "/v1/models/")):
+        model, separator, action = path.split("/models/", 1)[1].partition(":")
+        if separator and _XINGCHI_MODEL_RE.fullmatch(model) and action in {
+            "generateContent", "streamGenerateContent", "embedContent", "batchEmbedContents",
+        }:
+            return frozenset({"POST"})
+    return frozenset()
+
+
 XINGCHI_POST_PATHS = frozenset({
     "/v1/responses", "/v1/responses/compact", "/v1/responses/input_tokens",
     "/v1/chat/completions", "/v1/messages", "/v1/messages/count_tokens",
@@ -73,6 +107,8 @@ def _xingchi_allowed_methods(path: str) -> frozenset[str]:
 
 
 def allowed_methods(path: str) -> frozenset[str]:
+    if path.startswith(FREEGG_PREFIX + "/"):
+        return _freegg_allowed_methods(path)
     if path.startswith(XINGCHI_PREFIX + "/"):
         return _xingchi_allowed_methods(path)
     if path in ("/_health", "/_stats", "/v1/models", "/models"):
