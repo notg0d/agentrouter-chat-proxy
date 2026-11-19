@@ -29,6 +29,7 @@ def _upstream_base(raw: str) -> str:
 
 
 UPSTREAM = _upstream_base(os.environ.get("XINGCHI_UPSTREAM", "https://api.xingchiapi.com"))
+USER_AGENT = os.environ.get("XINGCHI_USER_AGENT", "dev-api-proxy")
 logger = logging.getLogger("xingchi-proxy")
 MAX_429_RETRIES = 2
 MAX_429_RECOVERY_S = 8.0
@@ -151,6 +152,8 @@ def register_chat_conversion(app: FastAPI, backend, *, prefix: str, upstream: st
         headers = backend._filter_headers(
             dict(request.headers), fallback_keys=(provider.upper() + "_API_KEY",), agentrouter_compat=False,
         )
+        if provider == "xingchi":
+            headers["user-agent"] = USER_AGENT
         headers["content-type"] = "application/json"
         body = json.dumps(chat_proxy.build_responses_payload(payload), ensure_ascii=False).encode("utf-8")
         response = None
@@ -208,6 +211,8 @@ def register_routes(app: FastAPI, backend, *, provider: str = "xingchi", upstrea
         headers = backend._filter_headers(
             dict(request.headers), fallback_keys=(provider.upper() + "_API_KEY",), agentrouter_compat=False,
         )
+        if provider == "xingchi":
+            headers["user-agent"] = USER_AGENT
         body = await request.body()
         response = None
         retries = 0

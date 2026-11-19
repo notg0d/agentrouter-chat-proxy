@@ -85,6 +85,10 @@ Xingchi errors do not start AgentRouter's shared retry delay.
 Use a Xingchi API key in `Authorization: Bearer ...`, `x-api-key`, or `x-goog-api-key`.
 Without these headers, the relay uses `XINGCHI_API_KEY` if configured.
 It never uses AgentRouter fallback keys for Xingchi routes.
+A Xingchi client policy can require an approved client identifier.
+Set `XINGCHI_USER_AGENT` to the exact User-Agent value that Xingchi authorizes for your integration.
+The default is `dev-api-proxy` and may be rejected until Xingchi approves that identifier.
+Do not use a client identifier that Xingchi has not authorized.
 A client-supplied key is forwarded as supplied; use the correct key for each provider.
 The local `X-Proxy-Token` remains separate and is not forwarded.
 

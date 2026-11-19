@@ -170,6 +170,13 @@ class XingchiRelayTests(unittest.IsolatedAsyncioTestCase):
         for request in self.calls[:4]:
             self.assertNotEqual(request.headers["user-agent"], "Codex Desktop")
 
+    async def test_configured_client_user_agent_is_forwarded(self):
+        with patch.object(xingchi_proxy, "USER_AGENT", "authorized-client"):
+            self.script.append(httpx.Response(200, json={}))
+            async with self.client(chat_proxy.app) as client:
+                await client.get("/xingchi/models", headers={"user-agent": "caller-value"})
+        self.assertEqual(self.calls[-1].headers["user-agent"], "authorized-client")
+
     async def test_preserves_queries_session_headers_and_strips_local_token(self):
         with patch.object(proxy, "PROXY_AUTH_TOKEN", "local-only"):
             self.script.append(httpx.Response(200, json={}))
