@@ -141,8 +141,9 @@ It never uses AgentRouter or Xingchi fallback keys for FreeGG requests.
 Use header authentication instead of a Gemini `key` query parameter.
 The separate local `X-Proxy-Token` is not forwarded.
 
-The relay preserves native request bodies, query parameters, responses, and SSE formats.
-It does not convert Chat Completions to Responses or apply AgentRouter history recovery and image pruning.
+The relay preserves native request bodies, query parameters, responses, and SSE formats for native FreeGG routes.
+FreeGG does not provide `/v1/chat/completions`, so the proxy converts FreeGG Chat Completions requests to `/v1/responses` and converts the result back for the client.
+The FreeGG conversion does not apply AgentRouter history recovery or image pruning.
 FreeGG uses the same bounded retry policy as the native Xingchi relay.
 HTTP `429` and eligible transport failures share two retries within an eight-second recovery window.
 Long upstream retry hints, permanent quota errors, and streams after output do not receive retries.
@@ -591,7 +592,7 @@ The health data on port `8789` include these fields:
 
 | Field | Meaning |
 | --- | --- |
-| `version` | Combined program version: `1.3.0` |
+| `version` | Combined program version: `1.3.1` |
 | `supported_apis` | `chat.completions` and `responses` |
 | `proxy_auth_enabled` | Whether local token authentication is enabled |
 | `max_body_bytes` | Configured request body limit |
@@ -610,7 +611,7 @@ For SSE, this counter does not confirm terminal completion.
 Version `1.0.0` of `chat_proxy.py` did not use session recovery for native Responses requests.
 After you update the code, stop the proxy process.
 Start the updated program again.
-Make sure that combined mode shows version `1.3.0` and both APIs in `supported_apis`.
+Make sure that combined mode shows version `1.3.1` and both APIs in `supported_apis`.
 Responses-only mode shows version `1.7.0`.
 
 ## Tests

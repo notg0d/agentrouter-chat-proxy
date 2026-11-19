@@ -53,7 +53,7 @@ DEFAULT_LISTEN_HOST = proxy.DEFAULT_LISTEN_HOST
 PORT = int(os.environ.get("CHAT_PROXY_PORT", "8789"))
 LISTEN_HOST, PORT = proxy._extract_uvicorn_bind_overrides(sys.argv, DEFAULT_LISTEN_HOST, PORT)
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 STATS: Dict[str, Any] = {
     "requests_total": 0,

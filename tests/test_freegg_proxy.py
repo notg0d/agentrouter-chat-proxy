@@ -1,5 +1,6 @@
 """FreeGG routing, native forwarding, credential isolation, and safety tests."""
 
+import json
 import os
 import sys
 import unittest
@@ -13,7 +14,7 @@ import freegg_proxy
 import proxy
 import xingchi_proxy
 from request_guard import allowed_methods
-from test_xingchi_proxy import ByteStream
+from tests.test_xingchi_proxy import ByteStream
 
 
 class FreeGGTests(unittest.IsolatedAsyncioTestCase):
@@ -61,17 +62,43 @@ class FreeGGTests(unittest.IsolatedAsyncioTestCase):
                 freegg_proxy._upstream_base(raw)
 
     async def test_native_paths_bodies_and_queries_on_both_apps(self):
-        body = b'{"model":"test","messages":[],"previous_response_id":"keep","reasoning_effort":"xhigh"}'
+        body = b'{"model":"test","messages":[{"role":"user","content":"hi"}],"previous_response_id":"keep","reasoning_effort":"xhigh"}'
         for app in (proxy.app, chat_proxy.app):
             async with self.client(app) as client:
                 for path in ("chat/completions", "responses", "messages", "images/edits", "audio/speech"):
-                    self.results.append(httpx.Response(200, content=b"native"))
+                    self.results.append(httpx.Response(200, json={
+                        "id": "resp", "model": "test", "status": "completed", "output": [],
+                    }) if path == "chat/completions" else httpx.Response(200, content=b"native"))
                     result = await client.post("/freegg/" + path + "?tag=a&tag=b", content=body)
-                    self.assertEqual(result.content, b"native")
+                    if path != "chat/completions":
+                        self.assertEqual(result.content, b"native")
                     self.assertEqual(self.calls[-1].url.host, "freegg.app")
-                    self.assertEqual(self.calls[-1].url.path, "/v1/" + path)
-                    self.assertEqual(self.calls[-1].content, body)
+                    self.assertEqual(
+                        self.calls[-1].url.path,
+                        "/v1/responses" if path == "chat/completions" else "/v1/" + path,
+                    )
+                    if path == "chat/completions":
+                        translated = json.loads(self.calls[-1].content)
+                        self.assertEqual(translated["input"][0]["content"], "hi")
+                        self.assertEqual(translated["model"], "test")
+                        self.assertNotIn("messages", translated)
+                    else:
+                        self.assertEqual(self.calls[-1].content, body)
                     self.assertEqual(self.calls[-1].url.params.get_list("tag"), ["a", "b"])
+
+    async def test_chat_completions_are_converted_for_freegg(self):
+        self.results.append(httpx.Response(200, json={
+            "id": "resp_1", "model": "test", "status": "completed",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "hello"}]}],
+        }))
+        async with self.client(proxy.app) as client:
+            result = await client.post("/freegg/v1/chat/completions", json={
+                "model": "test", "messages": [{"role": "user", "content": "hi"}],
+            })
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json()["choices"][0]["message"]["content"], "hello")
+        self.assertEqual(self.calls[-1].url.path, "/v1/responses")
+        self.assertEqual(json.loads(self.calls[-1].content)["input"][0]["content"], "hi")
 
     async def test_provider_keys_do_not_cross_namespaces(self):
         with patch.dict(os.environ, {"AGENTROUTER_API_KEY": "agent", "XINGCHI_API_KEY": "xingchi"}):
@@ -107,20 +134,29 @@ class FreeGGTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_streams_and_truncation_are_not_replayed(self):
         for app in (proxy.app, chat_proxy.app):
             async with self.client(app) as client:
-                for path, body in (("chat/completions", b'data: {"choices":[]}\n\ndata: [DONE]\n\n'),
-                                   ("messages", b'event: message_stop\ndata: {"type":"message_stop"}\n\n'),
+                for path, body in (("messages", b'event: message_stop\ndata: {"type":"message_stop"}\n\n'),
                                    ("responses", b'data: {"type":"response.completed"}\n\n')):
                     stream = ByteStream([body[:7], body[7:]], stall=True)
                     self.results.append(httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=stream))
                     result = await client.post("/freegg/" + path, json={})
                     self.assertEqual(result.content, body)
                     self.assertTrue(stream.closed)
-                partial = b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+                complete = (b'event: response.output_text.delta\ndata: {"delta":"hello"}\n\n'
+                            b'event: response.completed\ndata: {"response":{"status":"completed"}}\n\n')
+                self.results.append(httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=ByteStream([complete])))
+                result = await client.post("/freegg/chat/completions", json={
+                    "model": "test", "stream": True, "messages": [{"role": "user", "content": "hi"}],
+                })
+                self.assertIn(b'"content": "hello"', result.content)
+                self.assertIn(b'data: [DONE]', result.content)
+                partial = b'event: response.output_text.delta\ndata: {"delta":"partial"}\n\n'
                 self.results.append(httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=ByteStream([partial])))
-                result = await client.post("/freegg/chat/completions", json={})
+                result = await client.post("/freegg/chat/completions", json={
+                    "model": "test", "stream": True, "messages": [{"role": "user", "content": "hi"}],
+                })
                 self.assertEqual(result.content.count(b"partial"), 1)
-                self.assertIn("FreeGG stream ended", result.text)
-                self.assertNotIn("[DONE]", result.text)
+                self.assertIn("upstream_stream_interrupted", result.text)
+                self.assertIn("[DONE]", result.text)
 
     async def test_retry_policy_and_redaction(self):
         self.results.extend([httpx.Response(429, json={}), httpx.Response(200, json={"ok": True})])
