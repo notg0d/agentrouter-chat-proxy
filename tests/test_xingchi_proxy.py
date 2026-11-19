@@ -110,7 +110,6 @@ class XingchiRelayTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_native_requests_and_exact_paths_on_both_apps(self):
         cases = (
-            ("POST", "/xingchi/v1/chat/completions", "/v1/chat/completions"),
             ("POST", "/xingchi/responses", "/v1/responses"),
             ("POST", "/xingchi/messages", "/v1/messages"),
             ("POST", "/xingchi/v1beta/models/gemini-test:generateContent", "/v1beta/models/gemini-test:generateContent"),
@@ -132,6 +131,21 @@ class XingchiRelayTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(result.content, output)
                         self.assertEqual(str(self.calls[-1].url), "https://api.xingchiapi.com" + target)
                         self.assertEqual(self.calls[-1].content, body)
+
+    async def test_chat_completions_convert_directly_to_responses(self):
+        completion = {"id": "resp-1", "model": "test", "status": "completed",
+                      "output": [{"type": "message", "content": [{"type": "output_text", "text": "hello"}]}]}
+        body = {"model": "test", "messages": [{"role": "user", "content": "hi"}]}
+        for app in (proxy.app, chat_proxy.app):
+            calls_before = len(self.calls)
+            self.script.append(httpx.Response(200, json=completion))
+            async with self.client(app) as client:
+                result = await client.post("/xingchi/v1/chat/completions", json=body)
+            self.assertEqual(result.status_code, 200)
+            self.assertEqual(result.json()["choices"][0]["message"]["content"], "hello")
+            self.assertEqual(len(self.calls), calls_before + 1)
+            self.assertEqual(self.calls[-1].url.path, "/v1/responses")
+            self.assertEqual(json.loads(self.calls[-1].content)["input"][0]["content"], "hi")
 
     async def test_fallback_credentials_are_isolated_and_native_headers_win(self):
         with patch.dict(os.environ, {"CODEX_GATEWAY_API_KEY": "agent-only", "AGENTROUTER_API_KEY": "agent-other"}):
@@ -387,7 +401,6 @@ class XingchiRelayTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_native_sse_formats_are_preserved(self):
         streams = (
-            ("/xingchi/chat/completions", b'data: {"choices":[{"delta":{"reasoning_content":"think","tool_calls":[]}}]}\n\ndata: [DONE]\n\n'),
             ("/xingchi/messages", b'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"hello"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n'),
             ("/xingchi/responses", b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hello"}\n\nevent: response.completed\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n'),
             ("/xingchi/v1beta/models/gemini-test:streamGenerateContent", b'data: {"candidates":[{"content":{"parts":[{"text":"hello"}]},"finishReason":"STOP"}]}\n\ndata: {"usageMetadata":{"totalTokenCount":12}}\n\n'),
@@ -422,7 +435,6 @@ class XingchiRelayTests(unittest.IsolatedAsyncioTestCase):
         for path, content in (
             ("/xingchi/messages", b'event: message_stop\ndata: {"type":"message_stop"}\n\n'),
             ("/xingchi/responses", b'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n'),
-            ("/xingchi/chat/completions", b'data: [DONE]\n\n'),
         ):
             stream = ByteStream([content], stall=True)
             self.script.append(httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=stream))
@@ -490,12 +502,14 @@ class XingchiRelayTests(unittest.IsolatedAsyncioTestCase):
         self.script.append(httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=ByteStream([native_error])))
         async with self.client(chat_proxy.app) as client:
             self.assertEqual((await client.post("/xingchi/messages", json={})).content, native_error)
-            partial = b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+            partial = b'event: response.output_text.delta\ndata: {"delta":"partial"}\n\n'
             self.script.append(httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=ByteStream([partial])))
-            result = await client.post("/xingchi/chat/completions", json={})
-            self.assertEqual(result.content.count(b"partial"), 1)
+            result = await client.post("/xingchi/chat/completions", json={
+                "model": "test", "stream": True, "messages": [{"role": "user", "content": "hi"}],
+            })
+            self.assertIn("partial", result.text)
             self.assertIn("upstream_stream_interrupted", result.text)
-            self.assertNotIn("[DONE]", result.text)
+            self.assertIn("[DONE]", result.text)
         self.assertEqual(len(self.calls), 2)
 
     async def test_oversized_sse_frame_is_bounded_and_closed(self):
@@ -509,10 +523,10 @@ class XingchiRelayTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stream_delivers_before_completion_and_disconnect_closes_upstream(self):
         for app in (proxy.app, chat_proxy.app):
-            stream = ByteStream([b'data: {"choices":[{"delta":{"content":"first"}}]}\n\n'], stall=True)
+            stream = ByteStream([b'event: response.output_text.delta\ndata: {"delta":"first"}\n\n'], stall=True)
             self.script.append(httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=stream))
             messages = asyncio.Queue()
-            await messages.put({"type": "http.request", "body": b"{}", "more_body": False})
+            await messages.put({"type": "http.request", "body": b'{"model":"test","messages":[{"role":"user","content":"hi"}],"stream":true}', "more_body": False})
             first = asyncio.Event()
 
             async def send(message):

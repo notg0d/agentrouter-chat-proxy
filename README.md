@@ -64,7 +64,7 @@ The relay also permits these Sub2API compatibility routes under `/xingchi`:
 - `/antigravity/v1beta/models` and the same Gemini model routes and actions.
 
 Xingchi requests retain their native bodies, response formats, query parameters, and session headers.
-Chat Completions requests are not converted to Responses.
+Xingchi does not support Chat Completions natively, so the proxy converts Chat Completions requests to `/v1/responses` and converts the response back for clients.
 SSE responses stream directly instead of waiting for the complete response.
 The relay does not apply Azure recovery or image pruning to Xingchi requests.
 HTTP `429` responses and transport failures before response headers share two retries within an 8-second recovery window.
@@ -100,7 +100,7 @@ For a Responses-compatible client, use these settings:
 
 Set the provider's `env` value to `["XINGCHI_API_KEY"]`.
 Use your client's Responses-compatible API package.
-For native Chat Completions, use the Chat Completions package with the same URL.
+For Chat Completions clients, use the Chat Completions package with the same URL. The proxy converts these requests to Responses.
 For Anthropic clients, use `http://127.0.0.1:8789/xingchi` as the base URL.
 For Gemini clients, use `http://127.0.0.1:8789/xingchi/v1beta` as the API base.
 Responses-only mode provides the same Xingchi routes on port `8788`.

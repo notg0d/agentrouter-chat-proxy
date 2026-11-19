@@ -131,11 +131,77 @@ class _ProviderLogger(logging.LoggerAdapter):
         return message.replace("Xingchi", self.extra["label"]), kwargs
 
 
+def register_chat_conversion(app: FastAPI, backend, *, prefix: str, upstream: str, provider: str) -> None:
+    """Translate Chat Completions to the provider's Responses endpoint."""
+    async def handle_chat(request: Request):
+        backend.STATS["requests_total"] += 1
+        import chat_proxy
+
+        payload, error = await backend.read_json_payload(request)
+        if error is not None:
+            return error
+        messages = payload.get("messages")
+        if (not isinstance(messages, list) or not messages
+                or any(not isinstance(item, dict) for item in messages)
+                or any(item.get("role") not in ("system", "developer", "user", "assistant", "tool") for item in messages)):
+            return JSONResponse(status_code=400, content={"error": {
+                "type": "invalid_request_error", "message": "messages must be a non-empty array with supported roles",
+            }})
+
+        headers = backend._filter_headers(
+            dict(request.headers), fallback_keys=(provider.upper() + "_API_KEY",), agentrouter_compat=False,
+        )
+        headers["content-type"] = "application/json"
+        body = json.dumps(chat_proxy.build_responses_payload(payload), ensure_ascii=False).encode("utf-8")
+        response = None
+        try:
+            response = await backend._send_with_transport_retry(
+                backend.get_shared_client(), method="POST", url=upstream + "/v1/responses",
+                headers=headers, content=body, params=request.query_params.multi_items(),
+                stream=bool(payload.get("stream")), max_retries=2, request=request,
+            )
+            response_headers = backend._clean_response_headers(response.headers)
+            if response.is_success and "text/event-stream" in response.headers.get("content-type", "").lower():
+                queue = asyncio.Queue(maxsize=32)
+                producer_exc = []
+                producer_task = asyncio.create_task(backend._sse_producer(response, queue, producer_exc))
+                return backend._UpstreamStreamingResponse(
+                    chat_proxy._translate_responses_stream(
+                        response, primed_chunks=None, remainder=b"", queue=queue,
+                        producer_task=producer_task, producer_exc=producer_exc, model=payload["model"],
+                    ), upstream_response=response, producer_task=producer_task,
+                    status_code=response.status_code, headers={**response_headers, "cache-control": "no-cache"},
+                    media_type="text/event-stream",
+                )
+            content = await backend._read_and_close_response(response, request)
+            if not response.is_success:
+                return Response(content=content, status_code=response.status_code, headers=response_headers)
+            parsed = json.loads(content)
+            return JSONResponse(content=chat_proxy.responses_json_to_chat(parsed, payload["model"]),
+                                status_code=response.status_code, headers=response_headers)
+        except backend._ClientDisconnected:
+            return Response(status_code=499)
+        except Exception as exc:
+            if response is not None:
+                await backend._close_upstream_response(response)
+            return JSONResponse(status_code=502, content={"error": {
+                "type": "proxy_error", "code": f"{provider}_upstream_error",
+                "message": f"{provider} upstream error: {backend.describe_exception(exc)}",
+            }})
+
+    app.add_api_route(prefix + "/v1/chat/completions", handle_chat, methods=["POST"],
+                      name=f"{provider}_chat_completions_v1")
+    app.add_api_route(prefix + "/chat/completions", handle_chat, methods=["POST"],
+                      name=f"{provider}_chat_completions")
+
+
 def register_routes(app: FastAPI, backend, *, provider: str = "xingchi", upstream=None,
                     prefix: str = XINGCHI_PREFIX, path_mapper=xingchi_upstream_path) -> None:
     """Install the same native relay on both proxy applications."""
     label = "FreeGG" if provider == "freegg" else "Xingchi"
     logger = _ProviderLogger(logging.getLogger("xingchi-proxy"), {"label": label})
+    if provider == "xingchi":
+        register_chat_conversion(app, backend, prefix=prefix, upstream=upstream or UPSTREAM, provider=provider)
     async def handle_xingchi(request: Request, path: str):
         backend.STATS["requests_total"] += 1
         upstream_path = path_mapper(request.url.path)
