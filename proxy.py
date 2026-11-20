@@ -204,7 +204,9 @@ def _load_env():
                     k, v = line.split("=", 1)
                     k = k.strip()
                     v = v.strip().strip("'\"")
-                    if k not in os.environ:
+                    # Persist the local upload limit across terminal, launcher,
+                    # and supervisor restarts, including stale inherited values.
+                    if k == "PROXY_MAX_BODY_BYTES" or k not in os.environ:
                         os.environ[k] = v
 
 _load_env()

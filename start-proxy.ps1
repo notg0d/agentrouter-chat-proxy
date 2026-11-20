@@ -4,13 +4,13 @@
     Every path is derived from this script's own location, so the repository
     can be cloned anywhere by any user.
 
-    Does five things, in order:
-      0. Refuses to start a second instance on an already-healthy port.
+    Does six things, in order:
       1. Loads .env if one is present (values are never printed).
-      2. Activates .venv if one is present, else falls back to system Python.
-      3. Verifies fastapi / uvicorn / httpx are importable.
-      4. Verifies a credential exists WITHOUT printing it.
-      5. Starts uvicorn bound to $BindHost (default 127.0.0.1 loopback only).
+      2. Reuses a matching proxy and reports conflicts on the requested port.
+      3. Activates .venv if one is present, else falls back to system Python.
+      4. Verifies fastapi / uvicorn / httpx are importable.
+      5. Verifies a credential exists WITHOUT printing it.
+      6. Starts uvicorn bound to $BindHost (default 127.0.0.1 loopback only).
 
     Usage:
       .\start-proxy.ps1                            # interactive, Ctrl+C to stop
@@ -90,7 +90,43 @@ function Write-Warn { param([string]$m) Write-Line "[warn ] $m" 'Yellow' }
 function Write-Err  { param([string]$m) Write-Line "[fail ] $m" 'Red' }
 
 # ---------------------------------------------------------------------------
-# 0. Fast single-instance guard.
+# Load the local configuration before checking a running proxy.
+# ---------------------------------------------------------------------------
+function Import-ProxyEnvironment {
+    param([string]$EnvFile)
+    $bodyLimitValue = [Environment]::GetEnvironmentVariable('PROXY_MAX_BODY_BYTES')
+    if ([string]::IsNullOrWhiteSpace($bodyLimitValue)) { $bodyLimitValue = '20971520' }
+    if (Test-Path -LiteralPath $EnvFile) {
+        $loaded = 0
+        foreach ($line in (Get-Content -LiteralPath $EnvFile -ErrorAction Stop)) {
+            $trimmed = $line.Trim()
+            if (-not $trimmed -or $trimmed.StartsWith('#')) { continue }
+            $split = $trimmed.IndexOf('=')
+            if ($split -lt 1) { continue }
+            $name  = $trimmed.Substring(0, $split).Trim()
+            $value = $trimmed.Substring($split + 1).Trim().Trim('"').Trim("'")
+            # Match proxy.py: the local upload limit takes precedence.
+            if ($name -eq 'PROXY_MAX_BODY_BYTES') {
+                $bodyLimitValue = $value
+            } elseif ($name -and $value -and $null -eq [Environment]::GetEnvironmentVariable($name)) {
+                Set-Item -Path "Env:$name" -Value $value
+                $loaded++
+            }
+        }
+        Write-Ok ".env loaded ($loaded variable(s) added to the environment, values not displayed)"
+    }
+    $limit = 0L
+    if (-not [long]::TryParse($bodyLimitValue, [ref]$limit) -or $limit -le 0) {
+        throw 'PROXY_MAX_BODY_BYTES must be a positive integer.'
+    }
+    $env:PROXY_MAX_BODY_BYTES = [string]$limit
+    return $limit
+}
+
+$expectedBodyLimit = Import-ProxyEnvironment -EnvFile (Join-Path $root '.env')
+
+# ---------------------------------------------------------------------------
+# Fast single-instance guard.
 # ---------------------------------------------------------------------------
 if ([string]::IsNullOrWhiteSpace($BindHost)) { $BindHost = '127.0.0.1' } else { $BindHost = $BindHost.Trim() }
 
@@ -111,7 +147,7 @@ function Test-IsLoopbackHost {
     return ($clean -eq '127.0.0.1' -or $clean -eq 'localhost' -or $clean -eq '::1')
 }
 
-function Test-OurProxy {
+function Get-OurProxyHealth {
     param([int]$OnPort, [string]$OnHost = '127.0.0.1')
     $probeHost = Get-ProbeHost -OnHost $OnHost
     $urlHost = if ($probeHost -match ':' -and -not $probeHost.StartsWith('[')) { "[$probeHost]" } else { $probeHost }
@@ -119,9 +155,17 @@ function Test-OurProxy {
         $probe = Invoke-RestMethod "http://${urlHost}:${OnPort}/_health" -TimeoutSec 5 -ErrorAction Stop
         $required = if ($Mode -eq 'combined') { @('responses', 'chat.completions') } else { @('responses') }
         $missing = @($required | Where-Object { $_ -notin $probe.supported_apis })
-        return ($probe.proxy -in @('dev-api-proxy', 'agentrouter-codex-proxy', 'agentrouter-chat-proxy', 'agentrouter-llm-proxy', 'agentrouter-proxy') -and
-                $probe.status -eq 'ok' -and $probe.listen -eq "${OnHost}:${OnPort}" -and $missing.Count -eq 0)
-    } catch { return $false }
+        if ($probe.proxy -in @('dev-api-proxy', 'agentrouter-codex-proxy', 'agentrouter-chat-proxy', 'agentrouter-llm-proxy', 'agentrouter-proxy') -and
+            $probe.status -eq 'ok' -and $probe.listen -eq "${OnHost}:${OnPort}" -and $missing.Count -eq 0) {
+            return $probe
+        }
+    } catch { return $null }
+}
+
+function Test-OurProxy {
+    param([int]$OnPort, [string]$OnHost = '127.0.0.1')
+    $health = Get-OurProxyHealth -OnPort $OnPort -OnHost $OnHost
+    return ($null -ne $health -and $health.max_body_bytes -eq $expectedBodyLimit)
 }
 
 function Get-PortOwners {
@@ -146,34 +190,18 @@ function Show-PortConflict {
 
 $owners = Get-PortOwners -OnPort $Port
 if ($owners.Count -gt 0) {
-    if (Test-OurProxy -OnPort $Port -OnHost $BindHost) {
+    $health = Get-OurProxyHealth -OnPort $Port -OnHost $BindHost
+    if ($null -ne $health) {
+        if ($health.max_body_bytes -ne $expectedBodyLimit) {
+            Write-Err "proxy on ${BindHost}:${Port} uses upload limit $($health.max_body_bytes) bytes; configured limit is $expectedBodyLimit bytes."
+            Write-Err 'Stop the existing proxy in its original terminal once, then run this launcher again.'
+            exit 3
+        }
         Write-Ok "proxy already healthy on ${BindHost}:${Port} (PID $($owners -join ', ')) -- nothing to do"
         exit 0
     }
     Show-PortConflict -OnPort $Port -OwnerPids $owners
     exit 2
-}
-
-# ---------------------------------------------------------------------------
-# 1. Optional .env (never required, never printed)
-# ---------------------------------------------------------------------------
-$envFile = Join-Path $root '.env'
-if (Test-Path $envFile) {
-    $loaded = 0
-    foreach ($line in (Get-Content -LiteralPath $envFile -ErrorAction SilentlyContinue)) {
-        $trimmed = $line.Trim()
-        if (-not $trimmed -or $trimmed.StartsWith('#')) { continue }
-        $split = $trimmed.IndexOf('=')
-        if ($split -lt 1) { continue }
-        $name  = $trimmed.Substring(0, $split).Trim()
-        $value = $trimmed.Substring($split + 1).Trim().Trim('"').Trim("'")
-        if (-not $name -or -not $value) { continue }
-        if ($null -eq [Environment]::GetEnvironmentVariable($name)) {
-            Set-Item -Path "Env:$name" -Value $value
-            $loaded++
-        }
-    }
-    Write-Ok ".env loaded ($loaded variable(s), values not displayed)"
 }
 
 # ---------------------------------------------------------------------------

@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import mock_open, patch
 
 import httpx
 
@@ -449,6 +449,44 @@ class OpenCodePresentationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ConfigurationAndServiceTests(unittest.TestCase):
+    def test_local_body_limit_overrides_stale_inherited_value(self):
+        local_config = "# Local upload limit\nPROXY_MAX_BODY_BYTES=1073741824\n"
+        with patch.dict(os.environ, {"PROXY_MAX_BODY_BYTES": "20971520"}, clear=True), \
+                patch.object(proxy.os.path, "exists", return_value=True), \
+                patch("builtins.open", mock_open(read_data=local_config)):
+            proxy._load_env()
+            self.assertEqual(proxy._positive_setting("PROXY_MAX_BODY_BYTES", "20971520", integer=True), 1073741824)
+
+    def test_inherited_body_limit_is_retained_without_local_entry(self):
+        for local_config in ("", "# PROXY_MAX_BODY_BYTES=1073741824\nPROXY_PORT=8788\n"):
+            with self.subTest(local_config=local_config), \
+                    patch.dict(os.environ, {"PROXY_MAX_BODY_BYTES": "67108864"}, clear=True), \
+                    patch.object(proxy.os.path, "exists", return_value=True), \
+                    patch("builtins.open", mock_open(read_data=local_config)):
+                proxy._load_env()
+                self.assertEqual(os.environ["PROXY_MAX_BODY_BYTES"], "67108864")
+
+    def test_local_limit_override_preserves_inherited_auth_and_upstream(self):
+        inherited = {
+            "PROXY_MAX_BODY_BYTES": "20971520",
+            "PROXY_AUTH_TOKEN": "inherited-local-token",
+            "XINGCHI_API_KEY": "inherited-provider-key",
+            "XINGCHI_UPSTREAM": "https://inherited.example",
+        }
+        local_config = (
+            "PROXY_MAX_BODY_BYTES=1073741824\n"
+            "PROXY_AUTH_TOKEN=file-local-token\n"
+            "XINGCHI_API_KEY=file-provider-key\n"
+            "XINGCHI_UPSTREAM=https://file.example\n"
+        )
+        with patch.dict(os.environ, inherited, clear=True), \
+                patch.object(proxy.os.path, "exists", return_value=True), \
+                patch("builtins.open", mock_open(read_data=local_config)):
+            proxy._load_env()
+            self.assertEqual(os.environ["PROXY_MAX_BODY_BYTES"], "1073741824")
+            for key in ("PROXY_AUTH_TOKEN", "XINGCHI_API_KEY", "XINGCHI_UPSTREAM"):
+                self.assertEqual(os.environ[key], inherited[key])
+
     def test_modes_select_matching_workers_and_ports(self):
         with patch.dict(os.environ, {}, clear=True):
             for mode, port, module in (("responses", 8788, "proxy:app"), ("combined", 8789, "chat_proxy:app")):

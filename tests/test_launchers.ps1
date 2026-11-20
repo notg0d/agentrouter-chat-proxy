@@ -73,8 +73,8 @@ foreach ($file in @('start-proxy.ps1', 'install-autostart.ps1')) {
 }
 Write-Output 'Launcher OpenCode display messages OK'
 
-# Load only the health helpers and replace network access with a local fixture.
-foreach ($name in @('Get-ProbeHost', 'Test-OurProxy')) {
+# Load only the configuration and health helpers. Replace network access with a local fixture.
+foreach ($name in @('Import-ProxyEnvironment', 'Get-ProbeHost', 'Get-OurProxyHealth', 'Test-OurProxy')) {
     $node = $asts['start-proxy.ps1'].Find({
         param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -89,14 +89,68 @@ function Invoke-RestMethod {
 $Mode = 'combined'
 $script:HealthFixture = [pscustomobject]@{
     status = 'ok'; proxy = 'dev-api-proxy'; listen = '127.0.0.1:8789'
-    supported_apis = @('responses')
+    supported_apis = @('responses'); max_body_bytes = 1073741824
 }
+$expectedBodyLimit = 1073741824L
 Assert-Equal (Test-OurProxy -OnPort 8789) $false 'Combined mode rejects a Responses-only listener'
 $script:HealthFixture.supported_apis = @('responses', 'chat.completions')
 Assert-Equal (Test-OurProxy -OnPort 8789) $true 'Combined capabilities accepted'
+$script:HealthFixture.max_body_bytes = 20971520
+Assert-Equal (Test-OurProxy -OnPort 8789) $false 'Stale body limit is rejected'
+$script:HealthFixture.max_body_bytes = $expectedBodyLimit
 $script:HealthFixture.proxy = 'unrelated-service'
 Assert-Equal (Test-OurProxy -OnPort 8789) $false 'Unrelated service rejected'
 $script:HealthFixture.proxy = 'dev-api-proxy'
 $script:HealthFixture.listen = '0.0.0.0:8789'
 Assert-Equal (Test-OurProxy -OnPort 8789) $false 'Different bind address rejected'
 Write-Output 'Launcher health capability checks OK'
+
+# Exercise the env loader with an isolated temporary file and restore the
+# caller's process environment. The fixture contains no real credentials.
+function Write-Ok { param([string]$Message) }
+$envNames = @('PROXY_MAX_BODY_BYTES', 'XINGCHI_API_KEY', 'PROXY_AUTH_TOKEN', 'XINGCHI_UPSTREAM')
+$savedEnvironment = @{}
+foreach ($name in $envNames) {
+    $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
+}
+$fixturePath = Join-Path ([IO.Path]::GetTempPath()) ("proxy-env-test-{0}.env" -f [guid]::NewGuid())
+try {
+    [Environment]::SetEnvironmentVariable('PROXY_MAX_BODY_BYTES', '20971520')
+    [Environment]::SetEnvironmentVariable('XINGCHI_API_KEY', 'inherited-key-fixture')
+    [Environment]::SetEnvironmentVariable('PROXY_AUTH_TOKEN', 'inherited-token-fixture')
+    [Environment]::SetEnvironmentVariable('XINGCHI_UPSTREAM', 'https://inherited.invalid')
+    [IO.File]::WriteAllLines($fixturePath, @(
+        'PROXY_MAX_BODY_BYTES=1073741824',
+        'XINGCHI_API_KEY=file-key-fixture',
+        'PROXY_AUTH_TOKEN=file-token-fixture',
+        'XINGCHI_UPSTREAM=https://file.invalid'
+    ))
+    Assert-Equal (& { Import-ProxyEnvironment -EnvFile $fixturePath }) 1073741824L 'Local body limit overrides inherited value'
+    Assert-Equal $env:PROXY_MAX_BODY_BYTES '1073741824' 'Resolved body limit is exported to the worker'
+    Assert-Equal $env:XINGCHI_API_KEY 'inherited-key-fixture' 'Inherited provider key is preserved'
+    Assert-Equal $env:PROXY_AUTH_TOKEN 'inherited-token-fixture' 'Inherited local token is preserved'
+    Assert-Equal $env:XINGCHI_UPSTREAM 'https://inherited.invalid' 'Inherited upstream is preserved'
+
+    Remove-Variable bodyLimitValue -ErrorAction SilentlyContinue
+    [Environment]::SetEnvironmentVariable('PROXY_MAX_BODY_BYTES', $null)
+    $missingFixture = Join-Path ([IO.Path]::GetTempPath()) ("proxy-env-missing-{0}.env" -f [guid]::NewGuid())
+    Assert-Equal (& { Import-ProxyEnvironment -EnvFile $missingFixture }) 20971520L 'Default body limit is used when unset'
+
+    Remove-Variable bodyLimitValue -ErrorAction SilentlyContinue
+    [Environment]::SetEnvironmentVariable('PROXY_MAX_BODY_BYTES', '123456')
+    [IO.File]::WriteAllLines($fixturePath, @('# no body-limit setting'))
+    Assert-Equal (& { Import-ProxyEnvironment -EnvFile $fixturePath }) 123456L 'Inherited body limit remains when file omits it'
+
+    Remove-Variable bodyLimitValue -ErrorAction SilentlyContinue
+    [Environment]::SetEnvironmentVariable('PROXY_MAX_BODY_BYTES', '20971520')
+    [IO.File]::WriteAllLines($fixturePath, @('PROXY_MAX_BODY_BYTES=invalid'))
+    $invalidRejected = $false
+    try { & { Import-ProxyEnvironment -EnvFile $fixturePath } | Out-Null } catch { $invalidRejected = $true }
+    Assert-Equal $invalidRejected $true 'Invalid local body limit is rejected'
+    Write-Output 'Launcher environment precedence checks OK'
+} finally {
+    Remove-Item -LiteralPath $fixturePath -Force -ErrorAction SilentlyContinue
+    foreach ($name in $envNames) {
+        [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name])
+    }
+}

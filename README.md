@@ -495,6 +495,8 @@ See [Transport reliability](docs/transport-reliability.md) for source comparison
 3. Stop the proxy process.
 4. Start the proxy process again.
 
+The local `PROXY_MAX_BODY_BYTES` value in `.env` overrides a stale value inherited from the terminal. Both `proxy.py` and `start-proxy.ps1` apply this rule. On startup, the PowerShell launcher reuses a matching proxy. If a proxy is already running with another upload limit, stop that instance once and run the launcher again. Use the launcher for later starts.
+
 **CAUTION:** Do not add `.env` or API keys to Git.
 Other users can read keys in repository files.
 
@@ -508,7 +510,7 @@ Other users can read keys in repository files.
 | `CHAT_PROXY_PORT` | `8789` | Port for `chat_proxy.py` |
 | `PROXY_PORT` | `8788` | Port for `proxy.py` |
 | `PROXY_AUTH_TOKEN` | Empty | Separate local token; required for non-loopback startup |
-| `PROXY_MAX_BODY_BYTES` | `20971520` | Maximum uploaded or converted request body: 20 MiB |
+| `PROXY_MAX_BODY_BYTES` | `1073741824` | Maximum uploaded or converted request body: 1 GiB. The local `.env` value takes precedence over an inherited value. |
 | `PROXY_BODY_UPLOAD_TIMEOUT_S` | `60` | Total upload deadline in seconds |
 | `PROXY_MAX_SSE_FRAME_BYTES` | `8388608` | Maximum upstream SSE frame: 8 MiB |
 | `PROXY_MAX_SSE_PRIME_BYTES` | `8388608` | Maximum initial SSE buffer: 8 MiB |
@@ -540,6 +542,7 @@ HTTP `413` means the body exceeds the configured limit.
 HTTP `408` with `request_upload_timeout` means the upload exceeded its total deadline.
 Size and upload-time settings must be positive and finite.
 These are per-request limits, not a limit on total process memory or concurrent requests.
+Large concurrent uploads can use substantial memory.
 
 The listen address is not an `.env` setting.
 The `--host` option controls the listen address.
