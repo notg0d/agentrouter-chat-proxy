@@ -72,6 +72,9 @@ XINGCHI_GET_PATHS = frozenset({
     "/antigravity/models", "/antigravity/v1/models", "/antigravity/v1/usage",
     "/v1beta/models", "/antigravity/v1beta/models",
 })
+# The local /xingchi/codex namespace is an OpenAI-compatible façade. Chat
+# Completions are translated locally and sent to the Codex Responses endpoint.
+XINGCHI_CODEX_CHAT_PATHS = frozenset({"/backend-api/codex/chat/completions"})
 _XINGCHI_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _XINGCHI_GEMINI_ACTIONS = frozenset({"generateContent", "streamGenerateContent", "countTokens", "embedContent", "batchEmbedContents"})
 
@@ -80,6 +83,14 @@ def xingchi_upstream_path(path: str) -> str:
     """Map only the fixed Xingchi namespace; unversioned aliases use /v1."""
     if not path.startswith(XINGCHI_PREFIX + "/"):
         return ""
+    codex_prefix = XINGCHI_PREFIX + "/codex/"
+    if path.startswith(codex_prefix):
+        # Map /xingchi/codex[/v1]/... to the upstream Sub2API-compatible
+        # /backend-api/codex/... path without exposing an arbitrary proxy.
+        relative = path[len(codex_prefix):]
+        if relative.startswith("v1/"):
+            relative = relative[3:]
+        return "/backend-api/codex/" + relative
     upstream_path = path[len(XINGCHI_PREFIX):]
     if not upstream_path.startswith(("/v1/", "/v1beta/", "/antigravity/", "/backend-api/codex/")):
         upstream_path = "/v1" + upstream_path
@@ -88,6 +99,8 @@ def xingchi_upstream_path(path: str) -> str:
 
 def _xingchi_allowed_methods(path: str) -> frozenset[str]:
     upstream_path = xingchi_upstream_path(path)
+    if path.startswith(XINGCHI_PREFIX + "/codex/") and upstream_path in XINGCHI_CODEX_CHAT_PATHS:
+        return frozenset({"POST"})
     if upstream_path in XINGCHI_GET_PATHS:
         return frozenset({"GET"})
     if upstream_path in XINGCHI_POST_PATHS:

@@ -44,6 +44,7 @@ class XingchiRouteTests(unittest.TestCase):
         for path in ("/xingchi/models", "/xingchi/v1/models/gpt-test", "/xingchi/usage",
                      "/xingchi/v1/sub2api/billing", "/xingchi/v1beta/models/gemini-test",
                      "/xingchi/antigravity/v1/models", "/xingchi/backend-api/codex/models",
+                     "/xingchi/codex/v1/models",
                      "/xingchi/images/tasks/task_123"):
             with self.subTest(path=path):
                 self.assertEqual(allowed_methods(path), {"GET"})
@@ -54,10 +55,13 @@ class XingchiRouteTests(unittest.TestCase):
                      "/xingchi/antigravity/v1beta/models/gemini-test:streamGenerateContent",
                      "/xingchi/v1beta/models/gemini-test:countTokens",
                      "/xingchi/v1beta/models/gemini-test:embedContent",
+                     "/xingchi/codex/v1/responses", "/xingchi/codex/responses/compact",
+                     "/xingchi/codex/v1/chat/completions",
                      "/xingchi/images/generations/async"):
             with self.subTest(path=path):
                 self.assertEqual(allowed_methods(path), {"POST"})
         for path in ("/xingchi", "/xingchi/admin", "/xingchi/api/v1/keys", "/xingchi/v1/files",
+                     "/xingchi/backend-api/codex/chat/completions",
                      "/xingchi/v1/responses/id", "/xingchi/v1/models/..", "/xingchi/models/id/delete",
                      "/xingchi/v1beta/models/a:delete", "/xingchi/v1beta/models/a:b:generateContent",
                      "/xingchi/v1beta/models/a/other:generateContent", "/xingchi/v1/models/"):
@@ -115,7 +119,9 @@ class XingchiRelayTests(unittest.IsolatedAsyncioTestCase):
             ("POST", "/xingchi/v1beta/models/gemini-test:generateContent", "/v1beta/models/gemini-test:generateContent"),
             ("POST", "/xingchi/antigravity/v1/messages", "/antigravity/v1/messages"),
             ("POST", "/xingchi/backend-api/codex/responses/compact", "/backend-api/codex/responses/compact"),
+            ("POST", "/xingchi/codex/v1/responses/compact", "/backend-api/codex/responses/compact"),
             ("GET", "/xingchi/models", "/v1/models"),
+            ("GET", "/xingchi/codex/v1/models", "/backend-api/codex/models"),
             ("GET", "/xingchi/usage", "/v1/usage"),
             ("GET", "/xingchi/sub2api/billing", "/v1/sub2api/billing"),
         )
@@ -145,6 +151,26 @@ class XingchiRelayTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.json()["choices"][0]["message"]["content"], "hello")
             self.assertEqual(len(self.calls), calls_before + 1)
             self.assertEqual(self.calls[-1].url.path, "/v1/responses")
+            self.assertEqual(json.loads(self.calls[-1].content)["input"][0]["content"], "hi")
+
+    async def test_codex_compatibility_alias_translates_chat_without_faking_oauth(self):
+        completion = {"id": "resp-codex", "model": "test", "status": "completed",
+                      "output": [{"type": "message", "content": [{"type": "output_text", "text": "hello"}]}]}
+        body = {"model": "test", "messages": [{"role": "user", "content": "hi"}]}
+        for app in (proxy.app, chat_proxy.app):
+            calls_before = len(self.calls)
+            self.script.append(httpx.Response(200, json=completion))
+            async with self.client(app) as client:
+                result = await client.post(
+                    "/xingchi/codex/v1/chat/completions", json=body,
+                    headers={"authorization": "Bearer xingchi-key"},
+                )
+            self.assertEqual(result.status_code, 200)
+            self.assertEqual(result.json()["choices"][0]["message"]["content"], "hello")
+            self.assertEqual(len(self.calls), calls_before + 1)
+            self.assertEqual(self.calls[-1].url.path, "/backend-api/codex/responses")
+            self.assertEqual(self.calls[-1].headers["authorization"], "Bearer xingchi-key")
+            self.assertNotIn("originator", self.calls[-1].headers)
             self.assertEqual(json.loads(self.calls[-1].content)["input"][0]["content"], "hi")
 
     async def test_fallback_credentials_are_isolated_and_native_headers_win(self):

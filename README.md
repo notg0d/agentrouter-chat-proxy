@@ -41,7 +41,7 @@ Existing AgentRouter routes do not change.
 | `/xingchi/v1/responses` | `/v1/responses` | `POST` |
 | `/xingchi/v1/responses/compact` | `/v1/responses/compact` | `POST` |
 | `/xingchi/v1/responses/input_tokens` | `/v1/responses/input_tokens` | `POST` |
-| `/xingchi/v1/chat/completions` | `/v1/chat/completions` | `POST` |
+| `/xingchi/v1/chat/completions` | Translated to `/v1/responses` | `POST` |
 | `/xingchi/v1/messages` | `/v1/messages` | `POST` |
 | `/xingchi/v1/messages/count_tokens` | `/v1/messages/count_tokens` | `POST` |
 | `/xingchi/v1/models`, `/xingchi/v1/models/{model}` | Same route without `/xingchi` | `GET` |
@@ -62,6 +62,8 @@ The relay also permits these Sub2API compatibility routes under `/xingchi`:
 - `/backend-api/codex/models`, `/backend-api/codex/responses`, and the Responses `compact` and `input_tokens` subpaths.
 - `/antigravity/models`, `/antigravity/v1/models`, `/antigravity/v1/usage`, `/antigravity/v1/messages`, and `/antigravity/v1/messages/count_tokens`.
 - `/antigravity/v1beta/models` and the same Gemini model routes and actions.
+
+For clients that require the Codex-compatible Responses path, `/xingchi/codex/v1` is an OpenAI-compatible façade. Its `/responses`, `/responses/compact`, `/responses/input_tokens`, and `/models` paths map to `/backend-api/codex/...` upstream. `/chat/completions` is translated to a Responses request and sent to `/backend-api/codex/responses`. The façade uses the Xingchi API key and does not create or impersonate a ChatGPT OAuth session or add Codex client identity headers.
 
 Xingchi requests retain their native bodies, response formats, query parameters, and session headers.
 Xingchi does not support Chat Completions natively, so the proxy converts Chat Completions requests to `/v1/responses` and converts the response back for clients.
@@ -101,6 +103,17 @@ For a Responses-compatible client, use these settings:
 Set the provider's `env` value to `["XINGCHI_API_KEY"]`.
 Use your client's Responses-compatible API package.
 For Chat Completions clients, use the Chat Completions package with the same URL. The proxy converts these requests to Responses.
+
+#### OpenMinis and other custom OpenAI-compatible clients
+
+OpenMinis lets you add a custom OpenAI-compatible provider. Its API-key OpenAI provider uses Chat Completions by default; the proxy accepts those at `/xingchi/v1/chat/completions` and translates them to Xingchi's Responses API. In OpenMinis, create an OpenAI provider, set its custom base URL to `http://127.0.0.1:8789/xingchi`, leave the `/v1` suffix enabled, enter your Xingchi API key, and select a model available to that key. The app then calls the proxy's `/xingchi/v1` endpoints, including `/chat/completions` and `/models`. If you disable automatic `/v1` suffixing, use `http://127.0.0.1:8789/xingchi/v1` as the base instead.
+
+OpenMinis' built-in Codex mode is a separate integration: it sends a real ChatGPT OAuth token and Codex-specific headers to ChatGPT's Codex Responses endpoint. Those headers do not replace the OAuth credential. For Xingchi, use the custom API-key provider above; the proxy also relays Xingchi's `/backend-api/codex/...` compatibility aliases when a client needs those paths.
+
+If the Xingchi account expects the Codex-compatible Responses path, set the custom provider base URL to `http://127.0.0.1:8789/xingchi/codex`, keep automatic `/v1` suffixing enabled, and choose Responses mode (or keep Chat Completions; the proxy translates it). Use the Xingchi API key. OpenMinis' built-in Codex OAuth mode continues to call ChatGPT and does not use this API-key route.
+
+When OpenMinis runs on another device, use the proxy computer's reachable LAN address in place of `127.0.0.1` and configure the proxy to listen on that interface. If `PROXY_AUTH_TOKEN` is enabled, configure OpenMinis to send it separately as the `X-Proxy-Token` extra header; keep the Xingchi key in the API-key field.
+
 For Anthropic clients, use `http://127.0.0.1:8789/xingchi` as the base URL.
 For Gemini clients, use `http://127.0.0.1:8789/xingchi/v1beta` as the API base.
 Responses-only mode provides the same Xingchi routes on port `8788`.

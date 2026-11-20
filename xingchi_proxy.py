@@ -131,7 +131,10 @@ class _ProviderLogger(logging.LoggerAdapter):
         return message.replace("Xingchi", self.extra["label"]), kwargs
 
 
-def register_chat_conversion(app: FastAPI, backend, *, prefix: str, upstream: str, provider: str) -> None:
+def register_chat_conversion(
+    app: FastAPI, backend, *, prefix: str, upstream: str, provider: str,
+    endpoint_path: str = "/v1/responses",
+) -> None:
     """Translate Chat Completions to the provider's Responses endpoint."""
     async def handle_chat(request: Request):
         backend.STATS["requests_total"] += 1
@@ -156,7 +159,7 @@ def register_chat_conversion(app: FastAPI, backend, *, prefix: str, upstream: st
         response = None
         try:
             response = await backend._send_with_transport_retry(
-                backend.get_shared_client(), method="POST", url=upstream + "/v1/responses",
+                backend.get_shared_client(), method="POST", url=upstream + endpoint_path,
                 headers=headers, content=body, params=request.query_params.multi_items(),
                 stream=bool(payload.get("stream")), max_retries=2, request=request,
             )
@@ -189,10 +192,11 @@ def register_chat_conversion(app: FastAPI, backend, *, prefix: str, upstream: st
                 "message": f"{provider} upstream error: {backend.describe_exception(exc)}",
             }})
 
+    route_suffix = "_codex" if prefix.endswith("/codex") else ""
     app.add_api_route(prefix + "/v1/chat/completions", handle_chat, methods=["POST"],
-                      name=f"{provider}_chat_completions_v1")
+                      name=f"{provider}_chat_completions_v1{route_suffix}")
     app.add_api_route(prefix + "/chat/completions", handle_chat, methods=["POST"],
-                      name=f"{provider}_chat_completions")
+                      name=f"{provider}_chat_completions{route_suffix}")
 
 
 def register_routes(app: FastAPI, backend, *, provider: str = "xingchi", upstream=None,
@@ -202,6 +206,10 @@ def register_routes(app: FastAPI, backend, *, provider: str = "xingchi", upstrea
     logger = _ProviderLogger(logging.getLogger("xingchi-proxy"), {"label": label})
     if provider == "xingchi":
         register_chat_conversion(app, backend, prefix=prefix, upstream=upstream or UPSTREAM, provider=provider)
+        register_chat_conversion(
+            app, backend, prefix=prefix + "/codex", upstream=upstream or UPSTREAM, provider=provider,
+            endpoint_path="/backend-api/codex/responses",
+        )
     async def handle_xingchi(request: Request, path: str):
         backend.STATS["requests_total"] += 1
         upstream_path = path_mapper(request.url.path)
